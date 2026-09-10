@@ -26,8 +26,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>Ferry</string>
   <key>CFBundleIdentifier</key><string>dev.ahkamboh.ferry</string>
   <key>CFBundleIconFile</key><string>icon</string>
-  <key>CFBundleVersion</key><string>1.2.0</string>
-  <key>CFBundleShortVersionString</key><string>1.2.0</string>
+  <key>CFBundleVersion</key><string>1.3.0</string>
+  <key>CFBundleShortVersionString</key><string>1.3.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
