@@ -48,7 +48,7 @@ Ferry fixes both. It reads the files Claude Code already writes, lets you carry 
 |---|---|
 | **See every account** | every Claude account you've signed into on this machine, with its chats — even ones you're signed out of |
 | **Find CLI and VS Code chats** | sessions you ran with `claude` or in the editor that no account lists at all — read them, and add one to whichever account you like |
-| **Find Cursor chats** | conversations from Cursor, converted into Claude chats in the folder they were worked in (Windows) |
+| **Find Cursor chats** | conversations from Cursor, converted into Claude chats in the folder they were worked in |
 | **Identify them** | email for the account you're signed into; connectors, date range and project folders for the rest. Nickname any account and it sticks |
 | **Fix a chat's folder** | a chat you started without picking one shows under **No folder** in Claude — point it at the folder it really belongs to, and Claude names it there |
 | **Read any chat** | full conversation with proper Markdown — tables, code blocks, lists, quotes — plus tool calls |

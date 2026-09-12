@@ -534,11 +534,6 @@ fn source_scopes(claimed: &std::collections::HashSet<String>) -> Vec<Value> {
     out
 }
 
-/* Cursor support is Windows-only. Reading its database means bundling SQLite,
-   the one dependency here that costs anything, and none of this has been tried
-   on a Mac - so the macOS build takes neither the dependency nor the size, and
-   behaves exactly as it did before. */
-#[cfg(target_os = "windows")]
 mod cursor {
 use super::*;
 
@@ -571,8 +566,11 @@ fn cursor_db() -> Option<String> {
 /// Read-only, and never anything else.
 fn cursor_open() -> Option<rusqlite::Connection> {
     use rusqlite::OpenFlags;
+    // A plain path, not a URI. Cursor on macOS lives under Application Support,
+    // and a space inside a URI filename is a different file. READ_ONLY is the
+    // flag that matters; the CLI's file:?mode=ro is the same guarantee.
     rusqlite::Connection::open_with_flags(cursor_db()?,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI).ok()
+        OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
 }
 
 /// A cell, whether Cursor wrote it as text or as a blob.
@@ -819,23 +817,7 @@ pub fn cursor_detail(cid: &str) -> Result<Value, String> {
 
 }   // mod cursor
 
-#[cfg(target_os = "windows")]
 use cursor::{cursor_chats, cursor_detail, cursor_scope, cursor_write_transcript};
-
-/* Everywhere else there is no Cursor to read, and the rest of Ferry carries on
-   as though it had never been asked. */
-#[cfg(not(target_os = "windows"))]
-fn cursor_scope() -> Option<Value> { None }
-#[cfg(not(target_os = "windows"))]
-fn cursor_chats() -> Vec<Value> { vec![] }
-#[cfg(not(target_os = "windows"))]
-fn cursor_detail(_cid: &str) -> Result<Value, String> {
-    Err("Cursor chats are only read on Windows".into())
-}
-#[cfg(not(target_os = "windows"))]
-fn cursor_write_transcript(_chat: &Value) -> Result<String, String> {
-    Err("Cursor chats are only read on Windows".into())
-}
 
 /// Every <account>/<org> scope under the sessions root, found by walking the
 /// directory rather than by pattern matching. Returns (account, org, dir).
