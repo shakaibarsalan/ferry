@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
@@ -125,7 +125,10 @@ fn read_json(p: &str) -> Option<Value> {
 }
 #[cfg(target_os = "macos")]
 fn app_running() -> bool {
-    Command::new("pgrep").args(["-f", "Claude.app/Contents/MacOS/Claude"])
+    // -a is not optional. pgrep hides itself and every one of its ancestors
+    // unless it is passed, so a Ferry launched from the target app's own
+    // terminal would be told the app is not running.
+    Command::new("pgrep").args(["-a", "-f", "Claude.app/Contents/MacOS/Claude"])
         .output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
 }
 /// The desktop app is Chromium: while it runs it holds <user data>\lockfile open
@@ -296,7 +299,9 @@ fn source_of(entrypoint: &str) -> (&'static str, &'static str) {
         "cli"            => ("cli",     "Claude Code CLI"),
         "claude-vscode"  => ("vscode",  "VS Code"),
         "claude-desktop" => ("desktop", "Desktop, no record"),
-        "cursor"         => ("cursor",  "Cursor"),
+        // A leftover JSONL from converting out of Cursor, not the Cursor app.
+        // That dest is cursor_scope(), one row. Never emit source "cursor" here.
+        "cursor"         => ("other",   "Other sessions"),
         _                => ("other",   "Other sessions"),
     }
 }
@@ -494,7 +499,9 @@ fn source_scopes(claimed: &std::collections::HashSet<String>) -> Vec<Value> {
             if matches!(info["entrypoint"].as_str().unwrap_or(""), "sdk-cli" | "sdk") { continue; }
             let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
             let (subs, sub_bytes) = subagents_of(&dir, &id);
-            let (kind, name) = source_of(info["entrypoint"].as_str().unwrap_or(""));
+            let (mut kind, mut name) = source_of(info["entrypoint"].as_str().unwrap_or(""));
+            // leftover JSONL must not become the Cursor dest
+            if kind == "cursor" { kind = "other"; name = "Other sessions"; }
             names.insert(kind.to_string(), name);
             groups.entry(kind.to_string()).or_default().push(json!({
                 "id": format!("local_{}", id), "sid": id,
@@ -543,10 +550,10 @@ use super::*;
    composerHeaders, an ordered list of bubble ids in composerData:<id>, and one
    bubbleId:<chat>:<bubble> row per message. Nothing about it resembles the
    JSONL Claude Code appends, so a chat cannot be moved between them - it has to
-   be converted, and the conversion only goes one way. Writing into Cursor's
-   database would mean inserting rows into a live file it holds open, where a
-   mistake costs every conversation in it, so Ferry never does: every read here
-   opens it read-only. */
+   be converted. Reads are always read-only. Writes (Claude -> Cursor) are
+   refused while Cursor is running: the file is tens of GB and Cursor holds
+   it open. Do not trust SQLite's lock for that - the file opens read-write
+   while the app is up. */
 
 #[cfg(target_os = "windows")]
 fn cursor_dir() -> String {
@@ -561,6 +568,96 @@ fn cursor_dir() -> String { format!("{}/.config/Cursor/User", home()) }
 fn cursor_db() -> Option<String> {
     let p = format!("{}/globalStorage/state.vscdb", cursor_dir());
     if Path::new(&p).exists() { Some(p) } else { None }
+}
+
+fn cursor_app_dir() -> String {
+    Path::new(&cursor_dir()).parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(cursor_dir)
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill").args(["-0", &pid.to_string()])
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_alive(_pid: u32) -> bool { false }
+
+/// True if the Cursor app is up. code.lock holds the main pid; pgrep /
+/// tasklist is the fallback when the lock file was left behind. SQLite
+/// opening read-write is not a signal - that succeeds while Cursor is running.
+pub fn cursor_running() -> bool {
+    let lock = format!("{}/code.lock", cursor_app_dir());
+    if let Ok(s) = fs::read_to_string(&lock) {
+        if let Ok(pid) = s.trim().parse::<u32>() {
+            if pid_alive(pid) { return true; }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // -a is not optional here. By default pgrep excludes itself and all of
+        // its ancestors, and Cursor's main process is an ancestor of any Ferry
+        // started from a Cursor terminal - so the plain form answered "not
+        // running" for a Cursor that was plainly running.
+        return Command::new("pgrep").args(["-a", "-f", "Cursor.app/Contents/MacOS/Cursor"])
+            .output().map(|o| !o.stdout.is_empty()).unwrap_or(false);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let out = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Cursor.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        return out.map(|o| String::from_utf8_lossy(&o.stdout).contains("Cursor.exe")).unwrap_or(false);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    { false }
+}
+
+fn cursor_guard() -> Result<(), String> {
+    if cursor_running() { Err("Cursor is running - quit it first, then retry".into()) }
+    else { Ok(()) }
+}
+
+/// Signed-in Cursor account: email and display name from ItemTable.
+/// The CLI login in ~/.cursor/cli-config.json is a different account; ignore it.
+pub fn cursor_profile() -> Option<Value> {
+    let c = cursor_open()?;
+    let email: String = c.query_row(
+        "select value from ItemTable where key=?1",
+        ["cursorAuth/cachedEmail"],
+        |r| Ok(cell(r, 0).trim().trim_matches('"').to_string()),
+    ).unwrap_or_default();
+    let raw: String = c.query_row(
+        "select value from ItemTable where key=?1",
+        ["cursorAuth/cachedScopedProfile"],
+        |r| Ok(cell(r, 0)),
+    ).unwrap_or_default();
+    let name = serde_json::from_str::<Value>(&raw).ok()
+        .and_then(|v| v["displayName"].as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    if email.is_empty() && name.is_empty() { return None; }
+    Some(json!({ "email": email, "name": name }))
 }
 
 /// Read-only, and never anything else.
@@ -770,12 +867,14 @@ pub fn cursor_write_transcript(chat: &Value) -> Result<String, String> {
     Ok(path)
 }
 
-/// Cursor's conversations as one more source to import from. They have no
-/// transcript to point at until one is written, so they are addressed by
-/// "cursor:<conversation id>" rather than by a path.
+/// Cursor's conversations as one more source, and as a drop target for a
+/// Claude chat going the other way. They have no transcript to point at until
+/// one is written, so they are addressed by "cursor:<conversation id>".
+/// Shown whenever the DB file exists, even with 0 chats: the send-to list
+/// and the sidebar drop target need the row, not a conversation count.
 pub fn cursor_scope() -> Option<Value> {
+    if cursor_db().is_none() { return None; }
     let chats = cursor_chats();
-    if chats.is_empty() { return None; }
     let mut list: Vec<Value> = chats.iter().map(|c| json!({
         "id": format!("local_{}", c["id"].as_str().unwrap_or("")),
         "sid": c["id"], "title": c["title"], "cwd": c["folder"],
@@ -786,11 +885,12 @@ pub fn cursor_scope() -> Option<Value> {
         "path": format!("cursor:{}", c["id"].as_str().unwrap_or(""))
     })).collect();
     list.sort_by_key(|c| std::cmp::Reverse(c["last"].as_u64().unwrap_or(0)));
+    let prof = cursor_profile().unwrap_or(Value::Null);
     Some(json!({
         "acct": "source:cursor", "org": "source", "kind": "source",
         "source": "cursor", "sourceName": "Cursor",
         "chats": list, "deleted": [], "connectors": {},
-        "isCurrent": false, "label": "", "profile": Value::Null
+        "isCurrent": !prof.is_null(), "label": "", "profile": prof
     }))
 }
 
@@ -815,9 +915,384 @@ pub fn cursor_detail(cid: &str) -> Result<Value, String> {
                "bytes": bytes, "subs": 0, "msgs": msgs }))
 }
 
+fn fnv1a(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+
+/// Same id the Python CLI mints, so either side rewrites one Cursor chat.
+fn ferry_uuid(seed: &str) -> String {
+    let h = fnv1a(&format!("ferry-claude:{seed}"));
+    let h2 = fnv1a(&format!("ferry-claude2:{seed}"));
+    format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (h >> 32) as u32, ((h >> 16) & 0xffff) as u16, (h & 0xfff) as u16,
+        ((h2 >> 48) & 0xfff) as u16, h2 & 0xffffffffffff)
+}
+
+fn looks_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36 && b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-'
+}
+
+fn composer_id(rec: &Value) -> String {
+    let sid = rec["cliSessionId"].as_str()
+        .map(String::from)
+        .or_else(|| rec["sessionId"].as_str().map(|s| s.strip_prefix("local_").unwrap_or(s).to_string()))
+        .unwrap_or_default();
+    if looks_uuid(&sid) { sid } else { ferry_uuid(if sid.is_empty() {
+        rec["title"].as_str().unwrap_or("chat")
+    } else { &sid }) }
+}
+
+fn leap(y: i64) -> bool { y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) }
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let mut days = 0i64;
+    for yy in 1970..y { days += if leap(yy) { 366 } else { 365 }; }
+    const MD: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for mm in 1..m {
+        days += MD[(mm - 1) as usize];
+        if mm == 2 && leap(y) { days += 1; }
+    }
+    days + d - 1
+}
+
+fn civil_from_unix_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 { y += 1; }
+    (y as i32, m as u32, d as u32)
+}
+
+fn iso_from_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (y, m, d) = civil_from_unix_days(secs.div_euclid(86400));
+    let tod = secs.rem_euclid(86400);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
+}
+
+fn parse_iso_ms(raw: &str) -> Option<i64> {
+    let raw = raw.trim().trim_end_matches('Z').split('+').next().unwrap_or(raw);
+    if raw.len() < 16 { return None; }
+    let y: i64 = raw.get(0..4)?.parse().ok()?;
+    let mo: i64 = raw.get(5..7)?.parse().ok()?;
+    let d: i64 = raw.get(8..10)?.parse().ok()?;
+    let h: i64 = raw.get(11..13)?.parse().ok()?;
+    let mi: i64 = raw.get(14..16)?.parse().ok()?;
+    let s: i64 = raw.get(17..19).and_then(|x| x.parse().ok()).unwrap_or(0);
+    Some((days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s) * 1000)
+}
+
+fn ms_from(v: &Value, fallback: i64) -> i64 {
+    if let Some(n) = v.as_i64() {
+        if n > 10_i64.pow(11) { return n; }
+        if n > 10_i64.pow(9) { return n * 1000; }
+    }
+    if let Some(n) = v.as_u64() {
+        if n > 10u64.pow(11) { return n as i64; }
+        if n > 10u64.pow(9) { return (n as i64) * 1000; }
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(n) = s.parse::<i64>() {
+            if n > 10_i64.pow(11) { return n; }
+        }
+        if let Some(ms) = parse_iso_ms(s) { return ms; }
+    }
+    fallback
+}
+
+fn now_ms_i() -> i64 { now_ms() as i64 }
+
+fn cursor_richtext(text: &str) -> String {
+    let children: Vec<Value> = text.split('\n').map(|para| json!({
+        "children": if para.is_empty() { vec![] } else { vec![json!({
+            "detail": 0, "format": 0, "mode": "normal", "style": "",
+            "text": para, "type": "text", "version": 1
+        })] },
+        "direction": "ltr", "format": "", "indent": 0,
+        "type": "paragraph", "version": 1
+    })).collect();
+    json!({ "root": {
+        "children": if children.is_empty() {
+            vec![json!({"children":[],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1})]
+        } else { children },
+        "direction": "ltr", "format": "", "indent": 0, "type": "root", "version": 1
+    }}).to_string()
+}
+
+fn path_key(p: &str) -> String {
+    let s = Path::new(p).to_string_lossy().to_string();
+    if cfg!(windows) { s.to_ascii_lowercase() } else { s }
+}
+
+fn cursor_workspace_id(cwd: &str) -> String {
+    if cwd.is_empty() { return String::new(); }
+    let cwd_n = path_key(cwd);
+    let sep = if cfg!(windows) { "\\" } else { "/" };
+    let mut best = String::new();
+    let mut best_len = -1isize;
+    for (wid, p) in cursor_folders() {
+        let n = path_key(&p);
+        if cwd_n == n || cwd_n.starts_with(&(n.clone() + sep)) {
+            if n.len() as isize > best_len { best_len = n.len() as isize; best = wid; }
+        }
+    }
+    best
+}
+
+fn bubble_skel(bid: &str, typ: i64, text: &str, created: &str) -> Value {
+    let mut v = json!({
+        "_v": 3, "type": typ, "bubbleId": bid, "text": text,
+        "richText": cursor_richtext(text), "createdAt": created,
+        "conversationState": "~", "unifiedMode": 2, "isAgentic": false,
+        "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+    });
+    let o = v.as_object_mut().unwrap();
+    for k in [
+        "approximateLintErrors", "lints", "codebaseContextChunks", "commits",
+        "pullRequests", "attachedCodeChunks", "assistantSuggestedDiffs", "gitDiffs",
+        "interpreterResults", "images", "attachedFolders", "attachedFoldersNew",
+        "userResponsesToSuggestedCodeBlocks", "suggestedCodeBlocks",
+        "diffsForCompressingFiles", "relevantFiles", "toolResults", "notepads",
+        "capabilities", "multiFileLinterErrors", "diffHistories",
+        "recentLocationsHistory", "recentlyViewedFiles", "fileDiffTrajectories",
+        "docsReferences", "webReferences", "aiWebSearchResults",
+        "attachedFoldersListDirResults", "humanChanges", "summarizedComposers",
+        "cursorRules", "cursorCommands", "contextPieces", "editTrailContexts",
+        "allThinkingBlocks", "diffsSinceLastApply", "deletedFiles",
+        "supportedTools", "attachedFileCodeChunksMetadataOnly", "consoleLogs",
+        "uiElementPicked", "knowledgeItems", "documentationSelections",
+        "externalLinks", "projectLayouts", "capabilityContexts", "todos",
+        "mcpDescriptors", "workspaceUris", "pastChats",
+    ] { o.insert(k.into(), json!([])); }
+    for k in [
+        "existedSubsequentTerminalCommand", "existedPreviousTerminalCommand",
+        "attachedHumanChanges", "cursorCommandsExplicitlySet",
+        "pastChatsExplicitlySet", "isRefunded",
+    ] { o.insert(k.into(), json!(false)); }
+    v
+}
+
+fn flatten_turns(msgs: &[Value]) -> Vec<(String, String, String)> {
+    let mut out = vec![];
+    for m in msgs {
+        let mut text = m["text"].as_str().unwrap_or("").to_string();
+        if let Some(tools) = m["tools"].as_array() {
+            let extra: Vec<String> = tools.iter()
+                .filter_map(|t| t.as_str().map(|s| format!("-> {s}")))
+                .collect();
+            if !extra.is_empty() {
+                let block = extra.join("\n");
+                text = if text.is_empty() { block } else { format!("{text}\n\n{block}") };
+            }
+        }
+        let text = text.trim().to_string();
+        if text.is_empty() { continue; }
+        out.push((
+            m["role"].as_str().unwrap_or("assistant").to_string(),
+            text,
+            m["t"].as_str().unwrap_or("").to_string(),
+        ));
+    }
+    out
+}
+
+/// How long Ferry is willing to wait for the write lock. Cursor's own
+/// connection sets no busy_timeout at all, so it gets SQLITE_BUSY the instant
+/// someone else holds the lock and does not retry. Ferry is therefore the one
+/// that has to be patient, and the one that has to be quick.
+const CURSOR_BUSY_MS: i64 = 5000;
+
+/// What writing with Cursor open actually costs, in the words the user gets
+/// told. state.vscdb is WAL and the write is one short BEGIN IMMEDIATE
+/// transaction, so the file is not at risk. Two other things are, and neither
+/// is corruption: Cursor reads composerHeaders straight from SQL but only when
+/// its own sentinel key changes, and it has no way of noticing a change another
+/// process made - so the row is on disk immediately and on screen only after
+/// the window reloads. And while Ferry holds the write lock, Cursor's own
+/// writes fail outright instead of waiting.
+pub const CURSOR_LIVE_NOTE: &str =
+    "Cursor is open. The chat is written, and appears after you run \
+     Developer: Reload Window in Cursor.";
+
+/// The key range holding one conversation's bubbles. A prefix range, not LIKE:
+/// it is what Cursor itself uses to sweep a prefix, and on 1.8M rows it is an
+/// index seek rather than a scan.
+fn bubble_range(cid: &str) -> (String, String) {
+    (format!("bubbleId:{cid}:"), format!("bubbleId:{cid};"))
+}
+
+/// busy_timeout is a wait, not a queue: a Cursor that is committing without
+/// pause can hold the lock every time Ferry looks. The transaction rolls back
+/// on the way out, so nothing was written and the honest answer is to say so.
+fn busy_or(e: rusqlite::Error) -> String {
+    let s = e.to_string();
+    if s.contains("locked") || s.contains("busy") {
+        return "Cursor is writing too steadily to get a turn - nothing was \
+                changed. Try again in a moment, or quit Cursor and convert.".into();
+    }
+    s
+}
+
+/// Insert or replace one converted conversation. Same Claude session always
+/// lands on the same composerId, so a second export updates that one chat.
+///
+/// live says Cursor was left open on purpose. It changes nothing about the
+/// write, which is careful either way; it only decides whether the caller is
+/// told the window still has to be reloaded.
+pub fn cursor_write_claude(rec: &Value, msgs: &[Value], live: bool) -> Result<Value, String> {
+    let running = cursor_running();
+    if !live { cursor_guard()?; }
+    let db = cursor_db().ok_or("no Cursor storage here")?;
+    let turns = flatten_turns(msgs);
+    if turns.is_empty() {
+        return Err("nothing to convert - this chat's transcript was pruned".into());
+    }
+    let cid = composer_id(rec);
+    let title = rec["title"].as_str().unwrap_or("(untitled)").to_string();
+    let created = ms_from(&rec["createdAt"], ms_from(&json!(turns[0].2.clone()), now_ms_i()));
+    let last = ms_from(&rec["lastActivityAt"], ms_from(&json!(turns.last().unwrap().2.clone()), created));
+    let wid = cursor_workspace_id(rec["cwd"].as_str().unwrap_or(""));
+    let mut heads = vec![];
+    let mut bubbles = vec![];
+    for (i, (role, text, t)) in turns.iter().enumerate() {
+        let bid = ferry_uuid(&format!("bubble:{cid}:{i}"));
+        let typ = if role == "user" { 1 } else { 2 };
+        let created_iso = parse_iso_ms(t).map(iso_from_ms)
+            .unwrap_or_else(|| iso_from_ms(created + i as i64));
+        heads.push(json!({
+            "bubbleId": bid, "type": typ, "createdAt": created_iso,
+            "grouping": { "isRenderable": true, "hasText": true,
+                          "isShortPlainText": text.len() < 200,
+                          "toolDisplayComputed": true }
+        }));
+        bubbles.push((bid.clone(), bubble_skel(&bid, typ, text, &created_iso)));
+    }
+    let header = json!({
+        "type": "head", "composerId": cid, "name": title, "subtitle": "",
+        "createdAt": created, "lastUpdatedAt": last, "unifiedMode": 2,
+        "forceMode": "edit", "hasUnreadMessages": false, "isDraft": false,
+        "isArchived": false, "isSpec": false, "isProject": false,
+        "workspaceIdentifier": { "id": wid }
+    });
+    let data = json!({
+        "_v": 17, "composerId": cid, "name": title, "status": "completed",
+        "createdAt": created, "lastUpdatedAt": last, "unifiedMode": 2,
+        "hasLoaded": true, "fullConversationHeadersOnly": heads,
+        "text": turns[0].1, "richText": cursor_richtext(&turns[0].1)
+    });
+    let snap_dir = format!("{}/snapshots", vault());
+    let _ = fs::create_dir_all(&snap_dir);
+    let stem = format!("{}/{}-cursor-{}", snap_dir, stamp(), &cid[..8.min(cid.len())]);
+    let _ = fs::write(format!("{stem}.json"),
+        serde_json::to_string_pretty(&json!({
+            "composerId": cid, "title": title, "workspaceId": wid,
+            "header": header, "composerData": data,
+            "bubbles": bubbles.iter().map(|(_, b)| b).collect::<Vec<_>>()
+        })).unwrap_or_default());
+
+    let mut c = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+    c.busy_timeout(std::time::Duration::from_millis(CURSOR_BUSY_MS as u64))
+        .map_err(|e| e.to_string())?;
+    c.execute("create table if not exists composerHeaders (\
+        composerId text primary key, workspaceId text, createdAt integer,\
+        lastUpdatedAt integer, isArchived integer, isSubagent integer,\
+        recency integer, checkpointAt integer, value text, subagentTypeName text)", [])
+        .map_err(|e| e.to_string())?;
+    c.execute("create table if not exists cursorDiskKV (\
+        key text unique on conflict replace, value blob)", [])
+        .map_err(|e| e.to_string())?;
+    let (lo, hi) = bubble_range(&cid);
+
+    // One transaction, taken up front and let go quickly. Everything between
+    // BEGIN IMMEDIATE and COMMIT is time Cursor's own writes would fail in, so
+    // there is nothing in here that is not the write itself. Without it, a
+    // 4,500 message chat was 4,500 separate commits with the old rows already
+    // deleted - anything that stopped halfway left half a conversation.
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| busy_or(e))?;
+    {
+        let was_header: Option<Vec<Value>> = tx.query_row(
+            "select composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, \
+                    isSubagent, recency, checkpointAt, value, subagentTypeName \
+             from composerHeaders where composerId=?1",
+            [&cid],
+            |r| Ok((0..10).map(|i| json!(cell(r, i))).collect()),
+        ).ok();
+        let mut was_kv: Vec<Value> = vec![];
+        {
+            let mut q = tx.prepare("select key, value from cursorDiskKV \
+                                    where key=?1 or (key>=?2 and key<?3)")
+                .map_err(|e| e.to_string())?;
+            let rows = q.query_map(rusqlite::params![format!("composerData:{cid}"), &lo, &hi],
+                    |r| Ok(json!([cell(r, 0), cell(r, 1)])))
+                .map_err(|e| e.to_string())?;
+            for row in rows { if let Ok(v) = row { was_kv.push(v); } }
+        }
+        // a second convert of the same Claude chat: keep what it replaces
+        if was_header.is_some() || !was_kv.is_empty() {
+            let _ = fs::write(format!("{stem}-replaced.json"),
+                serde_json::to_string_pretty(&json!({
+                    "composerId": cid, "header": was_header, "cursorDiskKV": was_kv
+                })).unwrap_or_default());
+        }
+        tx.execute("delete from cursorDiskKV where key>=?1 and key<?2",
+                   rusqlite::params![&lo, &hi]).map_err(|e| e.to_string())?;
+        tx.execute("insert or replace into composerHeaders \
+                   (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, \
+                    isSubagent, recency, checkpointAt, value, subagentTypeName) \
+                   values (?1,?2,?3,?4,0,0,?5,?6,?7,'')",
+            rusqlite::params![cid, wid, created, last, last, last, header.to_string()])
+            .map_err(|e| e.to_string())?;
+        tx.execute("insert or replace into cursorDiskKV (key, value) values (?1,?2)",
+            rusqlite::params![format!("composerData:{cid}"), data.to_string()])
+            .map_err(|e| e.to_string())?;
+        for (bid, bub) in &bubbles {
+            tx.execute("insert or replace into cursorDiskKV (key, value) values (?1,?2)",
+                rusqlite::params![format!("bubbleId:{cid}:{bid}"), bub.to_string()])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| busy_or(e))?;
+    drop(c);
+
+    // Read it back on a connection of its own. A commit that reported success
+    // and a row that is really there are not the same claim.
+    let v = cursor_open().ok_or("cannot reopen Cursor storage to verify")?;
+    let hdr: i64 = v.query_row("select count(*) from composerHeaders where composerId=?1",
+        [&cid], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let body: i64 = v.query_row("select count(*) from cursorDiskKV where key=?1",
+        [format!("composerData:{cid}")], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let bubs: i64 = v.query_row("select count(*) from cursorDiskKV where key>=?1 and key<?2",
+        rusqlite::params![&lo, &hi], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if hdr != 1 || body != 1 || bubs != bubbles.len() as i64 {
+        return Err(format!(
+            "the write did not survive: {hdr} header, {body} body, {bubs} of {} messages",
+            bubbles.len()));
+    }
+
+    Ok(json!({ "ok": true, "id": cid, "title": title, "messages": turns.len(),
+               "workspaceId": wid, "folder": rec["cwd"].as_str().unwrap_or(""),
+               // Cursor's per-window chat list keeps only the headers whose
+               // workspaceIdentifier matches that window, so a chat whose
+               // folder matched no Cursor workspace is on disk and in no list.
+               // Reloading will not change that, and saying it would be a lie.
+               "noWorkspace": wid.is_empty(),
+               "needsReload": live && running }))
+}
+
 }   // mod cursor
 
-use cursor::{cursor_chats, cursor_detail, cursor_scope, cursor_write_transcript};
+use cursor::{cursor_chats, cursor_detail, cursor_running, cursor_scope, cursor_write_claude, cursor_write_transcript, CURSOR_LIVE_NOTE};
 
 /// Every <account>/<org> scope under the sessions root, found by walking the
 /// directory rather than by pattern matching. Returns (account, org, dir).
@@ -986,7 +1461,10 @@ fn scan() -> Value {
     list.extend(source_scopes(&claimed));
     if let Some(c) = cursor_scope() { list.push(c); }
     json!({ "scopes": list, "current": cur, "appRunning": app_running(),
+            "cursorRunning": cursor_running(),
+            "cursorLiveNote": CURSOR_LIVE_NOTE,
             "vault": vault(), "exportDir": last_export_dir(),
+            "version": env!("CARGO_PKG_VERSION"),
             "paths": { "sessions": sess(), "projects": proj(), "home": home() },
             "diag": diagnostics() })
 }
@@ -1355,6 +1833,20 @@ fn import_session(path: String, acct: String, org: String) -> Result<Value, Stri
     import_session_at(&path, &acct, &org)
 }
 
+/// Convert a Claude chat into a Cursor conversation. The JSONL stays; Cursor
+/// gets invented composer rows. Refused while Cursor is running unless the
+/// caller asks for live, which writes with Cursor open and says so.
+#[cfg_attr(target_os = "windows", tauri::command(async))]
+#[cfg_attr(not(target_os = "windows"), tauri::command)]
+fn export_to_cursor(path: String, live: Option<bool>) -> Result<Value, String> {
+    if path.starts_with("cursor:") {
+        return Err("that chat is already in Cursor".into());
+    }
+    let (rec, tr) = chat_parts(&path)?;
+    let msgs = collect_msgs(&tr, 100_000, 2_000_000);
+    cursor_write_claude(&rec, &msgs, live.unwrap_or(false))
+}
+
 /// The import itself, once there is a transcript to import. Kept apart from the
 /// command so a Cursor chat, whose transcript has only just been written, takes
 /// the very same path as one that was always there.
@@ -1530,8 +2022,8 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            scan, chat_detail, export_chat, copy_chat, import_session, set_folder,
-            rename_chat, delete_chat, undelete_chat, set_label, run_vault, set_zoom
+            scan, chat_detail, export_chat, copy_chat, import_session, export_to_cursor,
+            set_folder, rename_chat, delete_chat, undelete_chat, set_label, run_vault, set_zoom
         ])
         .run(tauri::generate_context!())
         .expect("failed to launch Ferry");

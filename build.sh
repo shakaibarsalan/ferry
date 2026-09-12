@@ -8,7 +8,9 @@ APP="${1:-$HOME/Applications/Ferry.app}"
 
 command -v cargo >/dev/null || { echo "Rust is required: https://rustup.rs"; exit 1; }
 
-echo "-> building"
+VER=$(awk -F'"' '/^version = /{print $2; exit}' "$ROOT/src-tauri/Cargo.toml")
+
+echo "-> building $VER"
 cargo build --release --manifest-path "$ROOT/src-tauri/Cargo.toml"
 
 echo "-> bundling $APP"
@@ -26,8 +28,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>Ferry</string>
   <key>CFBundleIdentifier</key><string>dev.ahkamboh.ferry</string>
   <key>CFBundleIconFile</key><string>icon</string>
-  <key>CFBundleVersion</key><string>1.4.0</string>
-  <key>CFBundleShortVersionString</key><string>1.4.0</string>
+  <key>CFBundleVersion</key><string>$VER</string>
+  <key>CFBundleShortVersionString</key><string>$VER</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>

@@ -48,7 +48,7 @@ Ferry fixes both. It reads the files Claude Code already writes, lets you carry 
 |---|---|
 | **See every account** | every Claude account you've signed into on this machine, with its chats — even ones you're signed out of |
 | **Find CLI and VS Code chats** | sessions you ran with `claude` or in the editor that no account lists at all — read them, and add one to whichever account you like |
-| **Find Cursor chats** | conversations from Cursor, converted into Claude chats in the folder they were worked in |
+| **Find Cursor chats** | conversations from Cursor, converted into Claude chats in the folder they were worked in — and Claude chats converted back into Cursor |
 | **Identify them** | email for the account you're signed into; connectors, date range and project folders for the rest. Nickname any account and it sticks |
 | **Fix a chat's folder** | a chat you started without picking one shows under **No folder** in Claude — point it at the folder it really belongs to, and Claude names it there |
 | **Read any chat** | full conversation with proper Markdown — tables, code blocks, lists, quotes — plus tool calls |
@@ -167,7 +167,8 @@ python3 ferry-cli.py export 1191f0ec txt      # disambiguate by session id
 python3 ferry-cli.py import 17b163e1 work@    # add a CLI chat to an account
 python3 ferry-cli.py folder "auth refactor" ~/code/api   # set a chat's folder
 python3 ferry-cli.py cursor                   # Cursor's own chats
-python3 ferry-cli.py cursor-import 4191e56f work@       # convert one to Claude
+python3 ferry-cli.py cursor-import 4191e56f work@       # Cursor -> Claude
+python3 ferry-cli.py cursor-export "the title"          # Claude -> Cursor
 python3 ferry-cli.py ui                       # serve the app UI at localhost:7777
 python3 ferry-cli.py ui --demo                # the same UI on synthetic data
 ```
@@ -193,23 +194,26 @@ Run `vault` from a launchd job or cron and your history is backed up nightly wit
 
 ## Cursor
 
-Cursor keeps its chats nothing like Claude Code does: not a folder of transcripts but a single SQLite file — one row per conversation in `composerHeaders`, an ordered list of bubble ids beside it, and one row per message, all inside `globalStorage\state.vscdb`. So a chat can't be *moved* between them. It has to be converted, and Ferry converts **one way only**.
+Cursor keeps its chats nothing like Claude Code does: not a folder of transcripts but a single SQLite file — one row per conversation in `composerHeaders`, an ordered list of bubble ids beside it, and one row per message, all inside `globalStorage/state.vscdb`. So a chat can't be *moved* between them. It has to be converted, both ways.
 
 ```bash
 python3 ferry-cli.py cursor                         # what Cursor has
-python3 ferry-cli.py cursor-import 4191e56f work@   # convert one into a Claude chat
+python3 ferry-cli.py cursor-import 4191e56f work@   # Cursor -> Claude
+python3 ferry-cli.py cursor-export "the chat title" # Claude -> Cursor
 ```
 
-`cursor` lists the conversations that actually contain something — most headers are empty shells left by windows that were opened and closed — grouped by the folder each was worked in, because Cursor's workspaces map to real directories. The converted chat lands in the account you name, in that folder, and Claude reads it like any other.
+`cursor` lists the conversations that actually contain something — most headers are empty shells left by windows that were opened and closed — grouped by the folder each was worked in, because Cursor's workspaces map to real directories. Cursor -> Claude lands in the account you name, in that folder. Claude -> Cursor invents composer rows and keeps the Claude JSONL. Converting the same chat twice updates that one conversation.
 
-What survives the crossing: every prompt and reply, in order, with their timestamps, and every tool call as a line naming the tool and its path or command. What doesn't: Cursor's diffs, thinking blocks and attached code chunks have no equivalent in Claude's format. A 4,563-bubble conversation converts to 241 turns in about half a second — only a couple of hundred bubbles hold prose, and three thousand are tool calls folded into the message before them.
+What survives the crossing: every prompt and reply, in order, with their timestamps, and every tool call as a line naming the tool and its path or command. What doesn't: Cursor's diffs, thinking blocks and attached code chunks, and Claude's thinking blocks. Those have no equivalent on the other side.
 
 Two deliberate limits:
 
-- **Nothing is ever written into Cursor.** Its database is opened `mode=ro` and only read. Going the other way would mean inserting rows into a live gigabyte file Cursor holds open, where one mistake costs every conversation in it.
-- **This is the one place Ferry writes a transcript** rather than only the small record beside it, because there is no transcript to point at — Cursor's conversations live in a database. The file is named after the Cursor conversation, so converting the same chat twice rewrites the one file instead of leaving a second copy.
+- **Quit Cursor before a write.** Its database is tens of GB and the app holds it open. SQLite will still open it read-write while Cursor is running, so Ferry checks the process (and `code.lock`) instead, and refuses. Reads stay `pragma query_only` / `SQLITE_OPEN_READ_ONLY`.
+- **Cursor -> Claude is the one place Ferry writes a transcript** rather than only the small record beside it, because there is no transcript to point at. The file is named after the Cursor conversation, so converting the same chat twice rewrites the one file.
 
-The app shows Cursor beside the CLI and VS Code, so a conversation drags onto an account like any other chat. Reading SQLite from Rust means bundling it, which is what took Ferry from 4.3 MB to 5.3 MB — the one dependency here that costs anything. The CLI gets it free from Python's standard library.
+The sidebar shows the signed-in Cursor account the same way it shows a Claude one (name and email from Cursor's own ItemTable, not from the CLI login). A Claude chat drags onto Cursor and converts; a Cursor chat still drags onto a Claude account. Demo mode never points at the real Cursor database.
+
+Reading SQLite from Rust means bundling it, which is what took Ferry from 4.3 MB to 5.3 MB — the one dependency here that costs anything. The CLI gets it free from Python's standard library.
 
 ## The archive
 

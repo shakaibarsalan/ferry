@@ -12,15 +12,17 @@
                                                   it belongs to
   ./ferry-cli.py cursor                           list Cursor's conversations
   ./ferry-cli.py cursor-import <text|id> <account>  convert one into a Claude chat
+  ./ferry-cli.py cursor-export <text|id>           convert a Claude chat into Cursor
 
 Chats started in the CLI or in VS Code have no per-account record, so Claude
 lists them nowhere. "list" shows them under the accounts; "import" gives one a
 record in the account you name. The transcript itself is never moved.
 
-Writes are refused while the Claude desktop app is running; every mutation
-snapshots the affected file into the vault first.
+Writes into Claude are refused while the Claude desktop app is running; writes
+into Cursor are refused while Cursor is running. Every mutation snapshots the
+affected rows or files into the vault first.
 """
-import json, os, re, shutil, sys, glob, subprocess, tempfile, threading, webbrowser
+import json, os, re, shutil, sys, glob, subprocess, tempfile, threading, webbrowser, uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -109,7 +111,10 @@ def app_running():
         except PermissionError: return True
         except OSError: return False
     try:
-        out = subprocess.run(["pgrep","-f","Claude.app/Contents/MacOS/Claude"],
+        # -a is not optional. pgrep hides itself and every one of its ancestors
+        # unless it is passed, so a Ferry launched from the target app's own
+        # terminal would be told the app is not running.
+        out = subprocess.run(["pgrep","-a","-f","Claude.app/Contents/MacOS/Claude"],
                              capture_output=True, text=True).stdout.strip()
         return bool(out)
     except Exception: return False
@@ -239,14 +244,16 @@ def transcripts_for(rec):
 # These are listed as read-only sources. A chat can be imported out of one into
 # an account; nothing is ever written back into them.
 
+# entrypoint "cursor" is a leftover JSONL Ferry wrote when converting out of
+# Cursor, not the Cursor app itself. That dest is cursor_scope(), one row.
 SOURCES = {"cli":            ("cli",     "Claude Code CLI"),
            "claude-vscode":  ("vscode",  "VS Code"),
-           "claude-desktop": ("desktop", "Desktop, no record"),
-           "cursor":         ("cursor",  "Cursor")}
+           "claude-desktop": ("desktop", "Desktop, no record")}
 INDEX = f"{VAULT}/sessions.json"
 # bumped whenever what is read out of a transcript changes, so an index written
 # by an older Ferry is re-read rather than believed
 INDEX_V = 3
+APP_VERSION = "1.5.0"
 # fields that describe the account and its environment rather than the chat
 INHERIT = ("envScopeId", "permissionMode", "effort", "chromePermissionMode",
            "remoteControlAutoEligible", "classifierSummaryEnabled")
@@ -376,6 +383,9 @@ def source_scopes(claimed):
         if info["entrypoint"] in ("sdk-cli", "sdk"): continue
         nsub, subb = subagents_of(os.path.dirname(path), sid)
         kind, name = SOURCES.get(info["entrypoint"], ("other", "Other sessions"))
+        # leftover JSONL (entrypoint cursor) is not the Cursor dest
+        if kind == "cursor" or info["entrypoint"] == "cursor":
+            kind, name = ("other", "Other sessions")
         g = groups.setdefault(kind, {
             "acct": f"source:{kind}", "org": "source", "kind": "source",
             "source": kind, "sourceName": name, "chats": [], "deleted": [],
@@ -457,7 +467,9 @@ def scan():
     cs = cursor_scope()
     if cs: sources.append(cs)
     return {"exportDir": export_dir(), "scopes": ordered + sources,
-            "current": cur, "appRunning": app_running(), "vault": VAULT}
+            "current": cur, "appRunning": app_running(),
+            "cursorRunning": cursor_running(), "vault": VAULT,
+            "version": APP_VERSION, "cursorLiveNote": CURSOR_LIVE_NOTE}
 
 # ---------- mutations ----------
 
@@ -732,6 +744,7 @@ OPS = {
     "undelete_chat": lambda acct, org, id, **k: op_undelete(acct, org, id),
     "set_label":     lambda acct, name, **k: (set_label(acct, name), {"ok": True})[1],
     "run_vault":     lambda **k: op_vault(),
+    "export_to_cursor": lambda path, live=False, **k: op_cursor_export(path, live=live),
 }
 
 class H(BaseHTTPRequestHandler):
@@ -864,13 +877,19 @@ def cmd_export(query, fmt="md"):
 
 def cmd_list():
     st = scan()
-    print(f"vault: {VAULT}   app running: {'YES (writes blocked)' if st['appRunning'] else 'no'}\n")
+    print(f"ferry {APP_VERSION}   vault: {VAULT}   claude: {'YES (writes blocked)' if st['appRunning'] else 'no'}"
+          f"   cursor: {'YES (writes blocked)' if st.get('cursorRunning') else 'no'}\n")
     for s in st["scopes"]:
         if s.get("kind") == "source":
-            # chats Claude Code wrote outside the desktop app, owned by nobody
-            print(f"{s['sourceName']}   (not in an account)")
-            print(f"   {len(s['chats'])} chats - add one with: "
-                  f"{os.path.basename(__file__)} import <text|id> <account>")
+            who = ""
+            if s.get("source") == "cursor" and s.get("profile"):
+                who = "  %s <%s>" % (s["profile"].get("name") or "",
+                                     s["profile"].get("email") or "")
+            print(f"{s['sourceName']}{who}   (not in a Claude account)")
+            extra = ("cursor-import <text|id> <account>" if s.get("source") == "cursor"
+                     else "import <text|id> <account>")
+            print(f"   {len(s['chats'])} chats - "
+                  f"{os.path.basename(__file__)} {extra}")
             for c in s["chats"][:5]:
                 print(f"     - {c['title'][:58]:60} {ts(c['last'])}  [{c['sid'][:8]}]")
             print()
@@ -985,7 +1004,7 @@ def _demo_transcript(title, model, turns, ms):
 def demo_setup():
     """Build the synthetic tree and point every root at it."""
     global CLAUDE, SESS, PROJ, CFG, IDB, VAULT, LABELS, PREFS, CURSOR, INDEX
-    global app_running, current_account, profiles
+    global app_running, current_account, profiles, cursor_running
 
     root   = tempfile.mkdtemp(prefix="ferry-demo-")
     # Cursor's own database is the one root that is not synthetic, and a demo
@@ -1054,6 +1073,7 @@ def demo_setup():
 
     prof = {a: {"email": e, "name": n} for a, _o, e, n, _l in DEMO_ACCTS if e}
     app_running     = lambda: False
+    cursor_running  = lambda: False
     current_account = lambda: DEMO_ACCTS[0][0]
     profiles        = lambda: prof
     return root
@@ -1119,10 +1139,8 @@ def cmd_folder(query, folder):
 # composerHeaders, an ordered list of bubble ids in composerData:<id>, and one
 # bubbleId:<chat>:<bubble> row per message. Nothing about it resembles the
 # JSONL Claude Code appends, so a chat cannot be moved between them - it has to
-# be converted, and the conversion only goes one way. Writing into Cursor's
-# database would mean inserting rows into a live 1 GB file that Cursor holds
-# open, where a mistake costs every conversation in it, so Ferry never does.
-# Every read here is mode=ro.
+# be converted. Reads are always mode=ro. Writes (Claude -> Cursor) are refused
+# while Cursor is running: the file is tens of GB and Cursor holds it open.
 
 if sys.platform == "win32":
     CURSOR = os.path.join(os.environ.get("APPDATA", ""), "Cursor", "User")
@@ -1135,10 +1153,128 @@ def cursor_db():
     p = os.path.join(CURSOR, "globalStorage", "state.vscdb")
     return p if os.path.exists(p) else None
 
+def cursor_app_dir():
+    """Parent of User/: .../Cursor, where code.lock lives."""
+    return os.path.dirname(CURSOR.rstrip("\\/"))
+
+def cursor_running():
+    """True if the Cursor app is up. code.lock holds the main pid; pgrep is
+    the fallback on a Mac whose lock file was left behind."""
+    lock = os.path.join(cursor_app_dir(), "code.lock")
+    try:
+        pid = int(open(lock, encoding="utf-8").read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            # -a is not optional here. By default pgrep excludes itself and all
+            # of its ancestors, and Cursor's main process is an ancestor of any
+            # Ferry started from a Cursor terminal - so the plain form answered
+            # "not running" for a Cursor that was plainly running.
+            out = subprocess.run(
+                ["pgrep", "-a", "-f", "Cursor.app/Contents/MacOS/Cursor"],
+                capture_output=True, text=True).stdout.strip()
+            return bool(out)
+        except Exception:
+            return False
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Cursor.exe"],
+                capture_output=True, text=True, creationflags=0x08000000).stdout
+            return "Cursor.exe" in out
+        except Exception:
+            return False
+    return False
+
+def cursor_guard():
+    if cursor_running():
+        raise RuntimeError("Cursor is running - quit it first, then retry")
+
+def cursor_profile():
+    """Signed-in Cursor account: email and display name from ItemTable."""
+    db = cursor_db()
+    if not db: return None
+    try:
+        c = cursor_ro(db)
+        email = c.execute("select value from ItemTable where key=?",
+                          ("cursorAuth/cachedEmail",)).fetchone()
+        prof = c.execute("select value from ItemTable where key=?",
+                         ("cursorAuth/cachedScopedProfile",)).fetchone()
+        def cell(row):
+            if not row: return ""
+            v = row[0]
+            if isinstance(v, bytes): v = v.decode("utf-8", "replace")
+            return str(v).strip().strip('"')
+        email = cell(email)
+        name = ""
+        raw = cell(prof)
+        if raw:
+            try: name = (json.loads(raw).get("displayName") or "").strip()
+            except Exception: pass
+        if not email and not name: return None
+        return {"email": email, "name": name}
+    except Exception:
+        return None
+
 def cursor_ro(path):
-    """Read-only, and never anything else."""
+    """Read-only, and never anything else. A plain path, not a URI: Cursor on
+    macOS lives under Application Support, and a space inside a URI filename
+    is a different file."""
     import sqlite3
-    return sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True)
+    c = sqlite3.connect(path)
+    c.execute("pragma query_only=ON")
+    return c
+
+CURSOR_BUSY_MS = 5000
+
+# What writing with Cursor open actually costs, in the words the user gets told.
+# state.vscdb is WAL and the write is one short BEGIN IMMEDIATE transaction, so
+# the file is not at risk. Two other things are, and neither is corruption:
+# Cursor reads composerHeaders straight from SQL but only when its own sentinel
+# key changes, and it has no way of noticing a change another process made - so
+# the row is on disk immediately and on screen only after the window reloads.
+# And Cursor's connection sets no busy_timeout, so while Ferry holds the write
+# lock Cursor's own writes fail outright instead of waiting.
+CURSOR_LIVE_NOTE = ("Cursor is open. The chat is written, and appears after you "
+                    "run Developer: Reload Window in Cursor.")
+
+def cursor_rw(path, busy_ms=CURSOR_BUSY_MS):
+    """Read-write, and willing to wait. state.vscdb is WAL, so a reader never
+    blocks a writer, but two writers still take turns. Cursor's own connection
+    sets no busy_timeout at all, so it gets SQLITE_BUSY the instant someone
+    else holds the write lock and does not retry. Ferry is therefore the one
+    that has to be patient, and the one that has to be quick.
+
+    isolation_level=None turns off Python's implicit transactions: the write
+    opens BEGIN IMMEDIATE itself, so the lock is taken up front rather than
+    upgraded halfway through."""
+    import sqlite3
+    c = sqlite3.connect(path, timeout=busy_ms / 1000.0, isolation_level=None)
+    c.execute("pragma busy_timeout=%d" % int(busy_ms))
+    return c
+
+def _cursor_bubble_range(cid):
+    """The key range holding one conversation's bubbles. A prefix range, not
+    LIKE: it is what Cursor itself uses to sweep a prefix, and on 1.8M rows it
+    is an index seek rather than a scan."""
+    return ("bubbleId:%s:" % cid, "bubbleId:%s;" % cid)
+
+def _cursor_affected(c, cid):
+    """Only the rows a convert of this composerId would overwrite. The database
+    is tens of gigabytes; nothing else is ever read, let alone copied."""
+    hdr = c.execute("""select composerId, workspaceId, createdAt, lastUpdatedAt,
+                              isArchived, isSubagent, recency, checkpointAt,
+                              value, subagentTypeName
+                       from composerHeaders where composerId=?""", (cid,)).fetchone()
+    lo, hi = _cursor_bubble_range(cid)
+    kv = list(c.execute("""select key, value from cursorDiskKV
+                           where key=? or (key>=? and key<?)""",
+                        ("composerData:" + cid, lo, hi)))
+    return {"composerId": cid, "header": list(hdr) if hdr else None,
+            "cursorDiskKV": [[k, v if isinstance(v, str) else None] for k, v in kv]}
 
 def cursor_folders():
     """Which folder each Cursor workspace is: workspace.json names it as a URI."""
@@ -1300,22 +1436,31 @@ def op_cursor_import(cid, acct, org, force=False):
     return rec
 
 def cursor_scope():
-    """Cursor's conversations as one more source to import from. They have no
-    transcript to point at until one is written, so they are addressed by
-    "cursor:<conversation id>" rather than by a path."""
-    chats = cursor_chats()
-    if not chats: return None
-    out = [{"id": "local_" + c["id"], "sid": c["id"], "title": c["title"],
-            "cwd": c["folder"], "model": "", "created": c["created"], "last": c["last"],
-            "turns": c["said"], "archived": c["archived"], "forkedFrom": None,
-            "files": 1, "subs": 0, "bytes": 0, "missing": 0, "absent": 0,
-            "branch": "", "version": "", "source": "cursor",
-            "path": "cursor:" + c["id"]} for c in chats]
-    out.sort(key=lambda c: c["last"] or 0, reverse=True)
-    return {"acct": "source:cursor", "org": "source", "kind": "source",
-            "source": "cursor", "sourceName": "Cursor", "chats": out,
-            "deleted": [], "connectors": {}, "cwds": {}, "isCurrent": False,
-            "label": "", "profile": None}
+    """Cursor's conversations as one more source, and as a drop target for a
+    Claude chat going the other way. They have no transcript to point at until
+    one is written, so they are addressed by "cursor:<conversation id>".
+    Shown whenever the DB file exists, even with 0 chats: the send-to list
+    and the sidebar drop target need the row, not a conversation count."""
+    if not cursor_db(): return None
+    try:
+        chats = cursor_chats()
+        prof = cursor_profile()
+        out = [{"id": "local_" + c["id"], "sid": c["id"], "title": c["title"],
+                "cwd": c["folder"], "model": "", "created": c["created"], "last": c["last"],
+                "turns": c["said"], "archived": c["archived"], "forkedFrom": None,
+                "files": 1, "subs": 0, "bytes": 0, "missing": 0, "absent": 0,
+                "branch": "", "version": "", "source": "cursor",
+                "path": "cursor:" + c["id"]} for c in chats]
+        out.sort(key=lambda c: c["last"] or 0, reverse=True)
+        return {"acct": "source:cursor", "org": "source", "kind": "source",
+                "source": "cursor", "sourceName": "Cursor", "chats": out,
+                "deleted": [], "connectors": {}, "cwds": {},
+                "isCurrent": bool(prof), "label": "", "profile": prof}
+    except Exception:
+        return {"acct": "source:cursor", "org": "source", "kind": "source",
+                "source": "cursor", "sourceName": "Cursor", "chats": [],
+                "deleted": [], "connectors": {}, "cwds": {},
+                "isCurrent": False, "label": "", "profile": None}
 
 def cursor_detail(cid):
     """A Cursor chat read straight out of Cursor, before anything is written."""
@@ -1330,6 +1475,278 @@ def cursor_detail(cid):
            "isArchived": chat["archived"], "source": "cursor", "sourceName": "Cursor"}
     return {"rec": rec, "files": [], "source": "cursor", "sourceName": "Cursor",
             "bytes": sum(len(m["text"]) for m in msgs), "subs": 0, "msgs": msgs}
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+def _fnv1a(s):
+    h = 0xcbf29ce484222325
+    for b in s.encode("utf-8"):
+        h ^= b
+        h = (h * 0x100000001b3) & 0xffffffffffffffff
+    return h
+
+def _ferry_uuid(seed):
+    """Same id the Rust side mints, so CLI and app rewrite one Cursor chat."""
+    h, h2 = _fnv1a("ferry-claude:" + seed), _fnv1a("ferry-claude2:" + seed)
+    return "%08x-%04x-4%03x-8%03x-%012x" % (
+        (h >> 32) & 0xffffffff, (h >> 16) & 0xffff, h & 0xfff,
+        (h2 >> 48) & 0xfff, h2 & 0xffffffffffff)
+
+def _ms(t, default=None):
+    if isinstance(t, (int, float)):
+        n = int(t)
+        if n > 10 ** 11: return n
+        if n > 10 ** 9: return n * 1000
+    s = str(t or "").strip()
+    if s.isdigit() and len(s) >= 12: return int(s)
+    if "T" in s:
+        raw = s.replace("Z", "").split("+")[0]
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+            try:
+                dt = datetime.strptime(raw[:26], fmt).replace(tzinfo=timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                continue
+    return default if default is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def _iso(t, default=None):
+    return datetime.fromtimestamp(_ms(t, default) / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
+
+def _composer_id(rec):
+    sid = rec.get("cliSessionId") or (rec.get("sessionId") or "").removeprefix("local_")
+    if _UUID_RE.match(sid or ""): return sid
+    return _ferry_uuid(sid or rec.get("title") or "chat")
+
+def _cursor_richtext(text):
+    children = []
+    for para in (text or "").split("\n"):
+        children.append({
+            "children": ([{"detail": 0, "format": 0, "mode": "normal", "style": "",
+                           "text": para, "type": "text", "version": 1}] if para else []),
+            "direction": "ltr", "format": "", "indent": 0, "type": "paragraph", "version": 1})
+    if not children:
+        children = [{"children": [], "direction": "ltr", "format": "", "indent": 0,
+                     "type": "paragraph", "version": 1}]
+    return json.dumps({"root": {"children": children, "direction": "ltr", "format": "",
+                                "indent": 0, "type": "root", "version": 1}},
+                      ensure_ascii=False)
+
+def _cursor_workspace_id(cwd):
+    cwd = os.path.normcase(os.path.normpath(cwd or ""))
+    if not cwd: return ""
+    best, best_len = "", -1
+    for wid, p in cursor_folders().items():
+        n = os.path.normcase(os.path.normpath(p))
+        if cwd == n or cwd.startswith(n + os.sep):
+            if len(n) > best_len:
+                best, best_len = wid, len(n)
+    return best
+
+def _export_turns(rec):
+    out = []
+    for m in full_msgs(rec):
+        text = m.get("text") or ""
+        if m.get("tools"):
+            extra = "\n".join("-> " + t for t in m["tools"])
+            text = (text + "\n\n" + extra) if text else extra
+        text = text.strip()
+        if not text: continue
+        out.append({"role": m["role"], "text": text, "t": m.get("t") or ""})
+    return out
+
+def _bubble_skel(bid, typ, text, created):
+    return {
+        "_v": 3, "type": typ, "bubbleId": bid, "text": text,
+        "richText": _cursor_richtext(text), "createdAt": created,
+        "conversationState": "~", "unifiedMode": 2, "isAgentic": False,
+        "approximateLintErrors": [], "lints": [], "codebaseContextChunks": [],
+        "commits": [], "pullRequests": [], "attachedCodeChunks": [],
+        "assistantSuggestedDiffs": [], "gitDiffs": [], "interpreterResults": [],
+        "images": [], "attachedFolders": [], "attachedFoldersNew": [],
+        "userResponsesToSuggestedCodeBlocks": [], "suggestedCodeBlocks": [],
+        "diffsForCompressingFiles": [], "relevantFiles": [], "toolResults": [],
+        "notepads": [], "capabilities": [], "multiFileLinterErrors": [],
+        "diffHistories": [], "recentLocationsHistory": [], "recentlyViewedFiles": [],
+        "fileDiffTrajectories": [], "docsReferences": [], "webReferences": [],
+        "aiWebSearchResults": [], "attachedFoldersListDirResults": [],
+        "humanChanges": [], "summarizedComposers": [], "cursorRules": [],
+        "cursorCommands": [], "contextPieces": [], "editTrailContexts": [],
+        "allThinkingBlocks": [], "diffsSinceLastApply": [], "deletedFiles": [],
+        "supportedTools": [], "attachedFileCodeChunksMetadataOnly": [],
+        "consoleLogs": [], "uiElementPicked": [], "knowledgeItems": [],
+        "documentationSelections": [], "externalLinks": [], "projectLayouts": [],
+        "capabilityContexts": [], "todos": [], "mcpDescriptors": [],
+        "workspaceUris": [],
+        "existedSubsequentTerminalCommand": False,
+        "existedPreviousTerminalCommand": False,
+        "attachedHumanChanges": False, "cursorCommandsExplicitlySet": False,
+        "pastChats": [], "pastChatsExplicitlySet": False, "isRefunded": False,
+        "tokenCount": {"inputTokens": 0, "outputTokens": 0},
+    }
+
+def write_cursor_chat(db_path, rec, msgs, live=False):
+    """Insert or replace one converted conversation. Same Claude session always
+    lands on the same composerId, so a second export updates that one chat.
+
+    live says Cursor was left open on purpose. It changes nothing about the
+    write, which is careful either way; it only decides whether the caller is
+    told the window still has to be reloaded."""
+    if not msgs:
+        raise RuntimeError("nothing to convert - this chat's transcript was pruned")
+    cid = _composer_id(rec)
+    title = rec.get("title") or "(untitled)"
+    created = _ms(rec.get("createdAt"), _ms(msgs[0].get("t")))
+    last = _ms(rec.get("lastActivityAt"), _ms(msgs[-1].get("t"), created))
+    wid = _cursor_workspace_id(rec.get("cwd") or "")
+    heads, bubbles = [], []
+    for i, m in enumerate(msgs):
+        bid = str(uuid.uuid5(uuid.NAMESPACE_URL, "ferry-bubble:%s:%d" % (cid, i)))
+        typ = 1 if m["role"] == "user" else 2
+        created_iso = _iso(m.get("t"), created + i)
+        text = m["text"]
+        heads.append({
+            "bubbleId": bid, "type": typ, "createdAt": created_iso,
+            "grouping": {"isRenderable": True, "hasText": True,
+                         "isShortPlainText": len(text) < 200,
+                         "toolDisplayComputed": True}})
+        bubbles.append((bid, _bubble_skel(bid, typ, text, created_iso)))
+    header = {
+        "type": "head", "composerId": cid, "name": title, "subtitle": "",
+        "createdAt": created, "lastUpdatedAt": last, "unifiedMode": 2,
+        "forceMode": "edit", "hasUnreadMessages": False, "isDraft": False,
+        "isArchived": False, "isSpec": False, "isProject": False,
+        "workspaceIdentifier": {"id": wid}}
+    data = {
+        "_v": 17, "composerId": cid, "name": title, "status": "completed",
+        "createdAt": created, "lastUpdatedAt": last, "unifiedMode": 2,
+        "hasLoaded": True, "fullConversationHeadersOnly": heads,
+        "text": msgs[0]["text"] if msgs else title,
+        "richText": _cursor_richtext(msgs[0]["text"] if msgs else title)}
+    snap = os.path.join(VAULT, "snapshots")
+    os.makedirs(snap, exist_ok=True)
+    stem = os.path.join(snap, "%s-cursor-%s" % (
+        datetime.now().strftime("%Y%m%d-%H%M%S"), cid[:8]))
+    open(stem + ".json", "w", encoding="utf-8").write(json.dumps({
+        "composerId": cid, "title": title, "workspaceId": wid,
+        "header": header, "composerData": data,
+        "bubbles": [b for _id, b in bubbles]}, indent=1))
+
+    c = cursor_rw(db_path)
+    c.execute("""create table if not exists composerHeaders (
+        composerId text primary key, workspaceId text, createdAt integer,
+        lastUpdatedAt integer, isArchived integer, isSubagent integer,
+        recency integer, checkpointAt integer, value text, subagentTypeName text)""")
+    c.execute("create table if not exists cursorDiskKV (key text unique on conflict replace, value blob)")
+    c.execute("create table if not exists ItemTable (key text unique on conflict replace, value blob)")
+    lo, hi = _cursor_bubble_range(cid)
+    # One transaction, taken up front and let go quickly. Everything between
+    # BEGIN IMMEDIATE and COMMIT is time Cursor's own writes would fail in, so
+    # there is nothing in here that is not the write itself.
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        was = _cursor_affected(c, cid)
+        if was["header"] or was["cursorDiskKV"]:
+            # a second convert of the same Claude chat: keep what it replaces
+            open(stem + "-replaced.json", "w", encoding="utf-8").write(
+                json.dumps(was, indent=1))
+        c.execute("delete from cursorDiskKV where key>=? and key<?", (lo, hi))
+        c.execute("""insert or replace into composerHeaders
+                     (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+                      isSubagent, recency, checkpointAt, value, subagentTypeName)
+                     values (?,?,?,?,0,0,?,?,?, '')""",
+                  (cid, wid, created, last, last, last, json.dumps(header, ensure_ascii=False)))
+        c.execute("insert or replace into cursorDiskKV (key, value) values (?,?)",
+                  ("composerData:" + cid, json.dumps(data, ensure_ascii=False)))
+        for bid, bub in bubbles:
+            c.execute("insert or replace into cursorDiskKV (key, value) values (?,?)",
+                      ("bubbleId:%s:%s" % (cid, bid), json.dumps(bub, ensure_ascii=False)))
+        c.execute("COMMIT")
+    except Exception as e:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        c.close()
+        # busy_timeout is a wait, not a queue: a Cursor that is committing
+        # without pause can hold the lock every time Ferry looks. Nothing was
+        # written, so the honest answer is to say so and let them retry.
+        if "locked" in str(e) or "busy" in str(e):
+            raise RuntimeError(
+                "Cursor is writing too steadily to get a turn - nothing was "
+                "changed. Try again in a moment, or quit Cursor and convert.")
+        raise
+    c.close()
+
+    # Read it back on a connection of its own. A commit that reported success
+    # and a row that is really there are not the same claim.
+    v = cursor_ro(db_path)
+    try:
+        hdr = v.execute("select count(*) from composerHeaders where composerId=?",
+                        (cid,)).fetchone()[0]
+        body = v.execute("select count(*) from cursorDiskKV where key=?",
+                         ("composerData:" + cid,)).fetchone()[0]
+        bubs = v.execute("select count(*) from cursorDiskKV where key>=? and key<?",
+                         (lo, hi)).fetchone()[0]
+    finally:
+        v.close()
+    if hdr != 1 or body != 1 or bubs != len(bubbles):
+        raise RuntimeError(
+            "the write did not survive: %d header, %d body, %d of %d messages"
+            % (hdr, body, bubs, len(bubbles)))
+
+    return {"ok": True, "id": cid, "title": title, "messages": len(msgs),
+            "workspaceId": wid, "folder": rec.get("cwd") or "",
+            # Cursor's per-window chat list keeps only the headers whose
+            # workspaceIdentifier matches that window, so a chat whose folder
+            # matched no Cursor workspace is on disk and in no list. Reloading
+            # will not change that, and saying it would be a lie.
+            "noWorkspace": not wid,
+            "needsReload": bool(live)}
+
+def op_cursor_export(path, live=False):
+    """Convert one Claude chat into a Cursor conversation. The JSONL stays;
+    Cursor gets invented composer rows.
+
+    Quitting Cursor first is still the default, and still the only way the chat
+    shows up straight away. live=True writes with Cursor open instead. That is
+    safe for the database and not free for Cursor - CURSOR_LIVE_NOTE says what
+    the trade is."""
+    if str(path).startswith("cursor:"):
+        raise RuntimeError("that chat is already in Cursor")
+    running = cursor_running()
+    if not live: cursor_guard()
+    db = cursor_db()
+    if not db: raise RuntimeError("no Cursor storage here")
+    rec = read_rec(path)
+    if not rec: raise RuntimeError("chat unreadable")
+    return write_cursor_chat(db, rec, _export_turns(rec), live=live and running)
+
+def cmd_cursor_export(query, live=False):
+    st = scan()
+    hits = []
+    for s in st["scopes"]:
+        if s.get("source") == "cursor": continue
+        for c in s["chats"]:
+            if (query.lower() in (c.get("title") or "").lower()
+                    or query in (c.get("sid") or "")
+                    or query in (c.get("id") or "")
+                    or query in (c.get("path") or "")):
+                hits.append(c)
+    if not hits: return print(f"no Claude chat matching {query!r}")
+    seen = {h["path"]: h for h in hits}
+    if len(seen) > 1:
+        print("matches more than one chat:")
+        for h in seen.values():
+            print("   %-40s [%s]" % ((h.get("title") or "")[:40], (h.get("sid") or "")[:8]))
+        return
+    chat = next(iter(seen.values()))
+    r = op_cursor_export(chat["path"], live=live)
+    print(f"{r['title']!r}")
+    print(f"  {r['messages']} turns -> Cursor  [{r['id'][:8]}]")
+    print(f"  folder     : {r['folder'] or '(none matched a Cursor workspace)'}")
+    if r.get("needsReload"): print(f"  {CURSOR_LIVE_NOTE}")
+    if r.get("noWorkspace"):
+        print("  note       : no Cursor workspace matched that folder, so the chat")
+        print("               is in the database but not in any window's list")
 
 def cmd_cursor():
     if not cursor_db():
@@ -1346,7 +1763,11 @@ def cmd_cursor():
                   (x["id"][:8], x["title"][:40], x["said"], x["bubbles"], ts(x["last"]),
                    "  (archived)" if x["archived"] else ""))
         print()
+    prof = cursor_profile() or {}
+    if prof.get("email") or prof.get("name"):
+        print("signed in as %s <%s>" % (prof.get("name") or "", prof.get("email") or ""))
     print("add one to an account with:  ferry-cli.py cursor-import <id|text> <account>")
+    print("send a Claude chat the other way:  ferry-cli.py cursor-export <id|text>")
 
 def cmd_cursor_import(query, who):
     chats = [x for x in cursor_chats()
@@ -1380,7 +1801,7 @@ def cmd_cursor_import(query, who):
 def cmd_ui():
     srv = HTTPServer(("127.0.0.1", PORT), H)
     url = f"http://127.0.0.1:{PORT}/"
-    print(f"ferry -> {url}   (ctrl-c to stop)")
+    print(f"ferry {APP_VERSION} -> {url}   (ctrl-c to stop)")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try: srv.serve_forever()
     except KeyboardInterrupt: print("\nstopped")
@@ -1400,6 +1821,10 @@ if __name__ == "__main__":
     elif a=="cursor-import":
         if len(sys.argv) < 4: print("usage: ferry-cli.py cursor-import <text|id> <account>")
         else: cmd_cursor_import(sys.argv[2], sys.argv[3])
+    elif a=="cursor-export":
+        if len(sys.argv) < 3:
+            print("usage: ferry-cli.py cursor-export <text|id> [--live]")
+        else: cmd_cursor_export(sys.argv[2], live="--live" in sys.argv[3:])
     elif a=="ui":
         if "--demo" in sys.argv:
             print(f"demo data -> {demo_setup()}")
