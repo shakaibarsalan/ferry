@@ -56,6 +56,28 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
 .acct:hover{background:var(--panel)}
 .acct.on{background:var(--panel);border-color:var(--line);box-shadow:var(--sh)}
 .acct.drop{border:1px dashed var(--accent);background:var(--panel)}
+/* A source is where chats come from, not an account one can be sent to, so it
+   is never a drop target and wears a mark rather than a coloured badge. */
+.av.src{background-color:var(--line);color:var(--dim);font-size:11px;letter-spacing:-.05em;
+ font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+/* VS Code and Cursor as their own marks, so a source is recognised at a glance
+   rather than guessed at. The official icons, scaled to 64px and carried inline
+   as data - this app fetches nothing at runtime, and a logo is no exception.
+   code.visualstudio.com/assets/apple-touch-icon.png and
+   cursor.com/marketing-static/icon-192x192{,-light}.png
+   Cursor's mark ships inside a squircle in a light and a dark cut, so it takes
+   whichever suits the theme; VS Code's is transparent and needs neither. */
+.av.lg{background-size:19px 19px;background-repeat:no-repeat;background-position:center}
+.acct .av.lg{background-size:20px 20px}
+.av.lg-vscode{background-image:url(data:image/png;base64,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)}
+.av.lg-cursor{background-size:26px 26px;background-image:url(data:image/png;base64,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)}
+.acct .av.lg-cursor{background-size:26px 26px}
+@media(prefers-color-scheme:dark){.av.lg-cursor{background-image:url(data:image/png;base64,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)}}
+/* a source that has a mark of its own wears it instead of a glyph */
+.av svg{width:17px;height:17px;display:block}
+.srcn{display:inline-block;padding:1px 6px;border-radius:6px;border:1px solid var(--line);
+ background:var(--raise);color:var(--dim);font-size:10px;font-weight:600;margin-left:6px;
+ vertical-align:1px;letter-spacing:.01em}
 .av{width:26px;height:26px;border-radius:8px;flex:none;display:grid;place-items:center;
  font-size:10.5px;font-weight:700;color:#fff;letter-spacing:.02em}
 .acct .who{font-size:12.5px;font-weight:560;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -224,6 +246,18 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
 .seg button.on{color:#fff}
 .seg button:not(.on):hover{color:var(--ink)}
 .nosend{font-size:12px;color:var(--faint)}
+/* The folder a chat belongs to. Claude names it in its own header and resumes
+   the chat there; one started without a folder shows under none until it is
+   given one. A chat not yet in an account has no record to change, so its
+   folder is shown but not offered. */
+.fol{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:8px;
+ border:1px solid var(--line);background:var(--panel);color:var(--dim);font-size:12px;
+ font-weight:500;max-width:270px;transition:.13s}
+.fol span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fol:not([disabled]):hover{border-color:var(--faint);color:var(--ink);background:var(--raise)}
+.fol.none{color:var(--warn);border-color:currentColor}
+.fol[disabled]{cursor:default;opacity:.85}
+.tools .vsep{width:1px;height:22px;background:var(--line)}
 #pmenu{position:fixed;display:none;min-width:210px;background:var(--panel);border:1px solid var(--line);
  border-radius:10px;box-shadow:var(--sh);padding:4px;z-index:40}
 #pmenu.on{display:block}
@@ -236,21 +270,12 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
 .route .who{transition:opacity .3s}
 .route .who.out{opacity:.45}                                   /* where a moved chat left */
 .askc .stat{margin-top:16px;text-align:center;font-size:13px;font-weight:560;color:var(--ink)}
-/* zoom control in the top bar: − 100% + (the percentage resets) */
-.zoomg{display:inline-flex;align-items:center;height:30px;border:1px solid var(--line);border-radius:8px;
- background:var(--panel);overflow:hidden}
-.zoomg button{height:100%;padding:0 10px;font-size:14px;line-height:1;color:var(--dim);transition:.13s}
-.zoomg button:hover{background:var(--raise);color:var(--ink)}
-.zoomg #zl{min-width:50px;padding:0 6px;font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums;
- border-left:1px solid var(--line);border-right:1px solid var(--line)}
 </style></head><body>
 
 <div id=bar>
   <span class=brand><span class=nm>Ferry</span></span>
   <span style="flex:1"></span>
   <span style="flex:1"></span><span id=lock></span>
-  <span class=zoomg id=zoom role=group aria-label="Zoom"><button id=zout onclick=zoomBy(-1) aria-label="Zoom out">−</button><button
-    id=zl onclick="setZoom(1,true)" aria-label="Reset zoom">100%</button><button id=zin onclick=zoomBy(1) aria-label="Zoom in">+</button></span>
   <button class=btn onclick=vault() title="Copy every chat and transcript into ~/.ferry. Protects against Claude deleting a chat and against the 30-day transcript cleanup.">Back up</button>
   <button class=btn onclick=refresh() title="Re-read the accounts and chats from disk">Refresh</button>
 </div>
@@ -365,28 +390,34 @@ const LOOK=[{look:1},{look:1},{look:1}],TRIP=[],CHEER=Array(7).fill(HAPPY);
 for(let i=0;i<=11;i++)TRIP.push({look:1,cargo:i/11});
 async function transfer(path,t,mv){
   if(busyOn)return;busyOn=true;
-  const a=$("#ask"),ok=(mv?"Moved to ":"Copied to ")+short(t);
-  let err=null,landed=false;
+  const imp=(mv==="import");
+  const a=$("#ask"),ok=(imp?"Added to ":mv?"Moved to ":"Copied to ")+short(t);
+  let err=null,landed=false,res=null;
   try{
     if(!a.className)ask(path,t,mv);                              // it always runs in the card
     if(!a.className)return;
     a.onclick=null;                                              // no cancelling mid-trip
-    $("#askh").textContent=mv?"Moving this chat…":"Copying this chat…";
+    $("#askh").textContent=imp?"Adding this chat…":mv?"Moving this chat…":"Copying this chat…";
     a.querySelectorAll(".askc p").forEach(x=>x.remove());
-    a.querySelector(".askb").outerHTML='<p class=stat id=astat>'+esc((mv?"Moving to ":"Copying to ")+short(t))+'…</p>';
+    a.querySelector(".askb").outerHTML='<p class=stat id=astat>'+
+      esc((imp?"Adding to ":mv?"Moving to ":"Copying to ")+short(t))+'…</p>';
     const m=a.querySelector(".route .mascot");m.classList.add("own");   // the idle loop lets go of it
     const play=fs=>new Promise(z=>{let i=0;(function f(){
       if(i>=fs.length||err)return z();m.innerHTML=drawMascot(fs[i++]);setTimeout(f,110);})();});
-    const work=iv("copy_chat",{path:path,acct:t.acct,org:t.org,mv:mv})
-      .then(()=>{},e=>{err=String(e);}).finally(()=>{landed=true;});
+    const work=(imp?iv("import_session",{path:path,acct:t.acct,org:t.org})
+                   :iv("copy_chat",{path:path,acct:t.acct,org:t.org,mv:mv}))
+      .then(r=>{res=r;},e=>{err=String(e);}).finally(()=>{landed=true;});
     if(still)await work;
     else{await play(LOOK);do{await play(TRIP);}while(!landed&&!err);}
     await work;
     if(err)return toast(err,true);
-    $("#askh").textContent=mv?"Chat moved":"Chat copied";          // the title says it; the status line
-    $("#astat").style.visibility="hidden";                           // steps aside, keeping its space
+    $("#askh").textContent=imp?"Chat added":mv?"Chat moved":"Chat copied";   // the title says it; the status
+    $("#astat").style.visibility="hidden";                           // line steps aside, keeping its space
     $("#tfrom").classList.remove("hl");$("#tto").classList.add("hl");   // the ring follows the chat
-    if(mv)$("#tfrom").classList.add("out");
+    if(mv===true)$("#tfrom").classList.add("out");
+    // an imported chat now lives in the account: follow it there, so the lists
+    // behind the card do not close on a chat that has just left the sources
+    if(imp&&res&&res.wrote){scopeKey=key(t);chatPath=res.wrote;}
     await Promise.all([                            // cheer while the lists redraw behind the card
       still?(m.innerHTML=drawMascot(HAPPY),new Promise(z=>setTimeout(z,700))):play(CHEER),
       (async()=>{await load();
@@ -426,24 +457,22 @@ document.addEventListener("keydown",e=>{
   if(MODK(e)&&e.key.toLowerCase()==="w"){e.preventDefault();closeChat();}});
 
 /* ---------- zoom ----------
-   Ctrl/Cmd + and - step through the levels, Ctrl/Cmd 0 resets (so does a click
-   on the percentage), and Ctrl/Cmd + wheel works too. In the app the webview
-   itself zooms, like a browser, so layout and drag and drop stay right, and
-   the level is remembered. The browser-served UI leaves zoom to the browser. */
+   Ctrl/Cmd + and - step through the levels, Ctrl/Cmd 0 resets, and Ctrl/Cmd +
+   wheel works too - the gestures a window is expected to answer, so the top bar
+   does not need to say so. In the app the webview itself zooms, like a browser,
+   so layout and drag and drop stay right, and the level is remembered. The
+   browser-served UI leaves zoom to the browser. */
 const INAPP=!!window.__TAURI_INTERNALS__;
 const ZOOMS=[.67,.75,.8,.9,1,1.1,1.25,1.5];
 let zoomLv=1;
 function setZoom(z,say){
   zoomLv=ZOOMS.reduce((a,b)=>Math.abs(b-z)<Math.abs(a-z)?b:a);   // snap to a level
   try{localStorage.setItem("ferry.zoom",zoomLv);}catch(e){}
-  $("#zl").textContent=Math.round(zoomLv*100)+"%";
   iv("set_zoom",{scale:zoomLv}).catch(()=>{});
-  if(say)toast("Zoom "+Math.round(zoomLv*100)+"%");
+  if(say)toast("Zoom "+Math.round(zoomLv*100)+"%");   // the only thing that says so
 }
 const zoomBy=d=>setZoom(ZOOMS[Math.max(0,Math.min(ZOOMS.length-1,ZOOMS.indexOf(zoomLv)+d))],true);
 if(INAPP){
-  const k=MAC?"⌘":"Ctrl ";
-  $("#zout").title="Zoom out ("+k+"−)";$("#zin").title="Zoom in ("+k+"+)";$("#zl").title="Reset zoom ("+k+"0)";
   document.addEventListener("keydown",e=>{
     if(!MODK(e)||e.altKey)return;
     if(e.key==="+"||e.key==="="||e.code==="NumpadAdd"){e.preventDefault();zoomBy(1);}
@@ -454,7 +483,7 @@ if(INAPP){
     if(Date.now()-lastWheel<150)return;lastWheel=Date.now();zoomBy(e.deltaY<0?1:-1);},{passive:false});
   let saved=1;try{saved=+localStorage.getItem("ferry.zoom")||1;}catch(e){}
   setZoom(saved);                                // bring back the last level
-}else $("#zoom").style.display="none";
+}
 
 /* ---------- close and confirm (Windows) ---------- */
 function closeChat(){if(!chatPath)return;
@@ -465,11 +494,37 @@ function chatAt(p){for(const s of S.scopes)for(const c of s.chats)if(c.path===p)
 // The card names an account by the part before the @; hovering shows the rest.
 // An account is named by its nickname, else its Claude display name, else the
 // part of its address before the @; hovering shows everything known about it.
-const short=s=>s.label||(s.profile&&s.profile.name)||label(s).split("@")[0];
-const whoTip=s=>[s.label,s.profile&&s.profile.name,s.profile&&s.profile.email]
+/* A source is not an account. The CLI and the VS Code extension write a
+   transcript for every session but no per-account record, so those chats sit on
+   disk owned by nobody. Ferry lists them so they can be imported into an
+   account; nothing is ever written back into a source. */
+const isSrc=s=>!!(s&&s.kind==="source");
+const accts=()=>S.scopes.filter(s=>!isSrc(s));
+const srcs=()=>S.scopes.filter(isSrc);
+/* VS Code and Cursor have marks of their own, so a source wears its own rather
+   than two characters standing in for it. Drawn here in the app's own style,
+   like the mascot and everything else: nothing is fetched at runtime. The two
+   that have no mark - a terminal, the SDK - keep their glyph. */
+const SRCAV={cli:">_",desktop:"[]",other:"··"};
+const SRCLOGO={vscode:'lg-vscode',cursor:'lg-cursor'};
+const srcCls =s=>SRCLOGO[s.source]?' lg '+SRCLOGO[s.source]:'';
+const srcMark=s=>SRCLOGO[s.source]?'':esc(SRCAV[s.source]||"··");
+const SRCTIP={cli:"Chats you started with the claude command",
+              vscode:"Chats you started in the VS Code extension",
+              // Cursor keeps its chats in a database of its own, so one is
+              // converted rather than moved, and only in this direction
+              cursor:"Conversations from Cursor. Adding one converts it into a Claude chat;\nnothing is ever written back into Cursor.",
+              desktop:"Desktop sessions no account has a record for",
+              other:"Sessions no account has a record for"};
+const short=s=>isSrc(s)?s.sourceName
+  :(s.label||(s.profile&&s.profile.name)||label(s).split("@")[0]);
+const whoTip=s=>isSrc(s)
+  ?[s.sourceName,SRCTIP[s.source]||"","Not in any account yet"].filter(Boolean).join("\n")
+  :[s.label,s.profile&&s.profile.name,s.profile&&s.profile.email]
   .filter((x,i,a)=>x&&a.indexOf(x)===i).concat("Account "+s.acct.slice(0,8)+(s.isCurrent?" · signed in now":"")).join("\n");
-const avatar=s=>'<span class=av style="background:hsl('+hue(s.acct)+' 42% 48%)">'+
-  esc(((s.profile&&s.profile.name)||label(s)).slice(0,2).toUpperCase())+'</span>';
+const avatar=s=>'<span class="av'+(isSrc(s)?' src'+srcCls(s):'')+'"'+
+  (isSrc(s)?'':' style="background:hsl('+hue(s.acct)+' 42% 48%)"')+'>'+
+  (isSrc(s)?srcMark(s):esc(((s.profile&&s.profile.name)||label(s)).slice(0,2).toUpperCase()))+'</span>';
 function who(s,id){
   return '<span class=who id='+id+' title="'+esc(whoTip(s))+'">'+avatar(s)+'<span>'+esc(short(s))+'</span></span>';}
 
@@ -495,6 +550,56 @@ function sendGroup(others){
       '<button'+(sendMv?' class=on':'')+' onclick=flip(true) title="Move it to '+to+
         '. You can restore it here from the deleted list.">Move</button></span></span>';
 }
+/* The same row for a chat no account owns. There is nothing to move out of and
+   nothing to leave behind, so it offers one action: give it a record in an
+   account. The transcript is not touched. */
+function importGroup(others){
+  if(!others.length)return '<span class=nosend>Sign in to an account in Claude to add this chat to it.</span>';
+  if(!others.some(x=>key(x)===tgtKey))tgtKey=key(others[0]);
+  const t=others.find(x=>key(x)===tgtKey),to=esc(short(t));
+  return '<span class=sendg><span class=cap>Add to</span>'+
+    '<button class=pick id=pick onclick="pickMenu(event)" title="'+esc(whoTip(t))+
+      '" aria-haspopup=listbox aria-expanded=false>'+avatar(t)+'<span>'+to+'</span>'+CHEVRON+'</button>'+
+    '<span class=sep></span>'+
+    '<button class="btn p" onclick=btnImport() title="Give this chat a record in '+to+
+      ', so Claude lists it there. The conversation itself stays where it is.">Add to account</button></span>';
+}
+function btnImport(){const t=accts().find(x=>key(x)===tgtKey);if(t)ask(chatPath,t,"import");}
+
+/* ---------- the folder a chat belongs to ----------
+   A chat's cwd is the folder Claude names in its header and resumes in, and it
+   is also where the conversation is looked up. Setting it here does both: the
+   record points at the new folder, and the transcript is hard-linked so it is
+   found from there too. A chat started without a folder ran in a workspace the
+   app made for it, which is why Claude shows it under none. */
+const SCRATCH=/scratch-workspaces/i;
+const folderOf=p=>String(p||"").replace(/[\\/]+$/,"").split(/[\\/]/).pop()||"";
+const FOLDSVG='<svg width=12 height=12 viewBox="0 0 12 12" aria-hidden=true><path d="M1 3.3a1 1 0 0 1 1-1h2.1'+
+  'l1 1.3H10a1 1 0 0 1 1 1v4.1a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1z" fill=none stroke=currentColor '+
+  'stroke-width=1.1 stroke-linejoin=round /></svg>';
+function folderChip(r,src){
+  const p=r.cwd||"",none=!p||SCRATCH.test(p);
+  const tip=(none?"Started without a folder, so Claude shows it under none.":p)+
+    (src?"\nImport it into an account to change this.":"\nClick to point this chat at a folder.");
+  return '<button class="fol'+(none?' none':'')+'"'+(src?' disabled':' onclick=doFolder()')+
+    ' title="'+esc(tip)+'">'+FOLDSVG+'<span>'+esc(none?"No folder":folderOf(p))+'</span></button>';
+}
+// like the download: the native panel is its own wait, so no card over it
+async function doFolder(){
+  try{
+    // the app opens a native folder panel; a browser has none, so it asks
+    let args={path:chatPath};
+    if(!INAPP){const p=prompt("Folder this chat belongs to:",(curD&&curD.rec.cwd)||"");
+               if(!p) return toast("Cancelled"); args.folder=p;}
+    const r=await iv("set_folder",args);
+    if(r.cancelled) return toast("Cancelled");
+    if(r.unchanged) return toast("Already in that folder");
+    await load();
+    if(chatPath){try{drawRead(await iv("chat_detail",{path:chatPath}));}catch(e){drawRead(null);}}
+    toast("Folder set to "+folderOf(r.cwd)+
+      (r.copied?" · transcript copied":r.linked?" · transcript linked, not duplicated":""));
+  }catch(e){toast(String(e),true);}
+}
 function flip(mv){sendMv=mv;const s=$(".seg");s.dataset.v=mv?"move":"copy";
   s.querySelectorAll("button").forEach((b,i)=>b.classList.toggle("on",i===(mv?1:0)));
   setTimeout(()=>btnSend(mv),160);}              // let the switch land, then the card
@@ -503,7 +608,7 @@ function pickMenu(e){e.stopPropagation();
   if(m.className){m.className="";p.setAttribute("aria-expanded","false");return;}
   p.setAttribute("aria-expanded","true");
   const b=p.getBoundingClientRect();
-  m.innerHTML=S.scopes.filter(x=>key(x)!==scopeKey).map(x=>
+  m.innerHTML=accts().filter(x=>key(x)!==scopeKey).map(x=>
     '<button class=mi role=menuitem data-k="'+esc(key(x))+'" title="'+esc(whoTip(x))+'">'+avatar(x)+
     '<span>'+esc(short(x))+'</span>'+(x.isCurrent?'<em>signed in</em>':'')+
     (key(x)===tgtKey?'<b>✓</b>':'')+'</button>').join("");
@@ -515,19 +620,24 @@ function pickMenu(e){e.stopPropagation();
 // itself chose only the destination. Either way it says what will happen.
 function ask(p,t,mv){
   const [s,c]=chatAt(p);if(!s||!t)return;
+  const imp=(mv==="import");                                   // it belongs to nobody yet
   const from=esc(short(s)),to=esc(short(t)),a=$("#ask");
   const btn=(id,txt,pri)=>'<button class="btn'+(pri?' p':'')+'" id='+id+'>'+txt+'</button>';
   a.innerHTML='<div class=askc role=dialog aria-modal=true aria-labelledby=askh>'+
-    '<h3 id=askh>'+(mv===null?'Send this chat to '+to:mv?'Move this chat?':'Copy this chat?')+'</h3>'+
+    '<h3 id=askh>'+(imp?'Add this chat to '+to+'?'
+                   :mv===null?'Send this chat to '+to:mv?'Move this chat?':'Copy this chat?')+'</h3>'+
     '<div class=ct>'+esc(c.title)+'</div>'+
     '<div class=route>'+who(s,"tfrom")+mascot()+who(t,"tto")+'</div>'+   // the trip it is about to make
-    (mv===null?'<p><b>Copy</b> keeps it in '+from+' as well. <b>Move</b> takes it out of '+from+
+    (imp?'<p>'+to+' gets a record for it, so Claude lists it there like any other chat. '+
+        'The conversation stays where it is on disk, and the session stays resumable from the '+from+'.</p>'
+     :mv===null?'<p><b>Copy</b> keeps it in '+from+' as well. <b>Move</b> takes it out of '+from+
         ', and you can restore it from the deleted list.</p>'
      :mv?'<p>It moves to '+to+' and leaves '+from+', where you can restore it from the deleted list.</p>'
      :'<p>It is added to '+to+' and stays in '+from+'.</p>')+
     (S.appRunning?'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>':'')+
     '<div class=askb>'+btn("an","Cancel")+
-      (mv===null?btn("am","Move")+btn("ac","Copy",1):btn("ago",mv?"Move":"Copy",1))+'</div></div>';
+      (imp?btn("ago","Add to "+to,1)
+       :mv===null?btn("am","Move")+btn("ac","Copy",1):btn("ago",mv?"Move":"Copy",1))+'</div></div>';
   a.className="on";wake();
   $("#tfrom").classList.add("hl");                             // the chat starts here
   $("#an").onclick=closeAsk;
@@ -645,30 +755,39 @@ function diagPanel(){
 }
 
 function drawSide(){
-  const s0=scope();
-  $("#side").innerHTML='<div class=secl>accounts</div>'+S.scopes.map(s=>{
-    const nm=RICH?short(s):label(s),ini=((s.profile&&s.profile.name)||nm).slice(0,2).toUpperCase();
-    const em=RICH&&s.profile&&s.profile.email;                    // Windows: name, then address
-    return '<div class="acct '+(key(s)===scopeKey?'on':'')+'" data-k="'+key(s)+'" onclick="pick(\''+key(s)+'\')"'+
+  const s0=scope(),A=accts(),R=srcs();
+  const row=s=>{
+    const nm=RICH?short(s):label(s);
+    const ini=isSrc(s)?srcMark(s):esc(((s.profile&&s.profile.name)||nm).slice(0,2).toUpperCase());
+    const em=!isSrc(s)&&RICH&&s.profile&&s.profile.email;          // Windows: name, then address
+    const mt=isSrc(s)?s.chats.length+' chat'+(s.chats.length===1?'':'s')+' · no account yet'
+      :s.chats.length+' chats'+(s.deleted.length?' · '+s.deleted.length+' deleted':'');
+    return '<div class="acct '+(isSrc(s)?'src ':'')+(key(s)===scopeKey?'on':'')+'" data-k="'+key(s)+'" onclick="pick(\''+key(s)+'\')"'+
         (RICH?' title="'+esc(whoTip(s))+'"':'')+'>'+
-      '<div class=av style="background:hsl('+hue(s.acct)+' 42% 48%)">'+esc(ini)+'</div>'+
+      '<div class="av'+(isSrc(s)?' src'+srcCls(s):'')+'"'+(isSrc(s)?'':' style="background:hsl('+hue(s.acct)+' 42% 48%)"')+'>'+ini+'</div>'+
       '<div class=bd><div class=who>'+(s.isCurrent?'<span class=dotc></span>':'')+esc(nm)+'</div>'+
       (em?'<div class=em>'+esc(em)+'</div>':'')+
-      '<div class=mt>'+s.chats.length+' chats'+(s.deleted.length?' · '+s.deleted.length+' deleted':'')+'</div>'+
-      '</div></div>';}).join("")
-   +(s0?'<div class=secl>rename</div><div style="padding:0 9px"><input id=nick placeholder="name this account" value="'+
+      '<div class=mt>'+mt+'</div>'+
+      '</div></div>';};
+  $("#side").innerHTML='<div class=secl>accounts</div>'+A.map(row).join("")
+   // Sessions Claude Code wrote outside the desktop app. They are listed under
+   // the accounts because that is where they are heading, not beside them.
+   +(R.length?'<div class=secl title="Chats Claude Code wrote outside the desktop app. Open one and add it to an account.">not in an account</div>'+R.map(row).join(""):"")
+   +(s0&&!isSrc(s0)?'<div class=secl>rename</div><div style="padding:0 9px"><input id=nick placeholder="name this account" value="'+
       esc(s0.label||'')+'" onchange="setLabel(\''+s0.acct+'\',this.value)"></div>':'')
-   +'<div class=foot title="'+esc('sessions: '+((S.paths||{}).sessions||'?')+String.fromCharCode(10)+'projects: '+((S.paths||{}).projects||'?'))+'">'+S.scopes.length+' accounts · '+
-      S.scopes.reduce((a,x)=>a+x.chats.length,0)+' chats · '+
-      S.scopes.reduce((a,x)=>a+x.deleted.length,0)+' deleted</div>';
-  document.querySelectorAll(".acct").forEach(el=>{
+   +'<div class=foot title="'+esc('sessions: '+((S.paths||{}).sessions||'?')+String.fromCharCode(10)+'projects: '+((S.paths||{}).projects||'?'))+'">'+A.length+' accounts · '+
+      A.reduce((a,x)=>a+x.chats.length,0)+' chats · '+
+      A.reduce((a,x)=>a+x.deleted.length,0)+' deleted'+
+      (R.length?'<br>'+R.reduce((a,x)=>a+x.chats.length,0)+' from the CLI and VS Code':'')+'</div>';
+  // a source is never a drop target: there is no record there to write
+  document.querySelectorAll(".acct:not(.src)").forEach(el=>{
     el.ondragover=e=>{if(dragged&&el.dataset.k!==scopeKey){e.preventDefault();el.classList.add("drop");}};
     el.ondragleave=()=>el.classList.remove("drop");
     el.ondrop=e=>{e.preventDefault();el.classList.remove("drop");askDrop(e,el.dataset.k);};});
   // Windows: accept dragenter as well as dragover - a strict drop target needs
   // both, or the pointer over an account's name or avatar shows "no drop" -
   // and only clear the highlight when the pointer really leaves the account.
-  if(RICH)document.querySelectorAll(".acct").forEach(el=>{
+  if(RICH)document.querySelectorAll(".acct:not(.src)").forEach(el=>{
     const ok=()=>dragged&&el.dataset.k!==scopeKey;
     el.ondragenter=e=>{if(ok()){e.preventDefault();el.classList.add("drop");}};
     el.ondragover=e=>{if(ok()){e.preventDefault();e.dataTransfer.dropEffect="copy";el.classList.add("drop");}};
@@ -682,7 +801,10 @@ function drawList(){
   const L=s.chats.filter(c=>!q||c.title.toLowerCase().includes(q));
   $("#list").innerHTML='<input id=q placeholder="Search '+s.chats.length+' chats" value="'+esc(q)+'">'
    +(L.length?L.map(c=>'<div class="ch '+(chatPath===c.path?'on':'')+'" draggable=true data-p="'+esc(c.path)+
-      '" onclick="openChat(this.dataset.p)">'+(c.missing?'<span class=warnd title="transcript pruned"></span>':'')+
+      '" onclick="openChat(this.dataset.p)"'+
+      // a CLI chat is known by the folder it ran in, so say which one
+      (c.source&&c.cwd?' title="'+esc(c.cwd)+'"':'')+'>'+
+      (c.missing?'<span class=warnd title="transcript pruned"></span>':'')+
       '<span class=t>'+esc(c.title)+'</span><span class=n>'+(c.turns||0)+'</span></div>').join("")
      :'<div class=empty style="padding:40px 10px">No match</div>')
    +(s.deleted.length?'<div class=secl>deleted</div>'+s.deleted.map(d=>'<div class="ch dead">'+
@@ -701,6 +823,8 @@ function drawList(){
 function askDrop(e,k){
   const p=dragged;if(!p)return;
   const t=S.scopes.find(s=>key(s)===k),d=$("#drop");
+  const [s0]=chatAt(p);
+  if(isSrc(s0))return ask(p,t,"import");     // nowhere to move it out of: it can only be added
   if(RICH)return ask(p,t,null);                                  // Windows: the choice is made on the card
   d.style.left=Math.min(e.clientX,innerWidth-200)+"px";
   d.style.top=Math.min(e.clientY,innerHeight-56)+"px";
@@ -723,18 +847,22 @@ async function openChat(p){chatPath=p;drawList();
 function drawRead(d){
   if(!d){$("#read").innerHTML='<div class=empty>Select a conversation.<br>'+
     'Drag one onto an account in the sidebar to copy or move it.</div>';return;}
-  const r=d.rec,others=S.scopes.filter(x=>key(x)!==scopeKey);curD=d;
+  // a chat no account owns yet: nothing to rename, nothing to delete it from,
+  // and the row below offers to add it to an account rather than to send it on
+  const r=d.rec,src=isSrc(scope()),others=accts().filter(x=>key(x)!==scopeKey);curD=d;
   const meta=esc((r.model||"").replace("claude-",""))+' · '+(r.completedTurns||0)+
        ' turns · '+day(r.createdAt)+' → '+day(r.lastActivityAt)+' · '+d.files.length+
-       ' transcripts · '+fmt(d.bytes)+(d.subs?' · '+d.subs+' subagent':'');
-  const ttl='<input id=ttl value="'+esc(r.title)+'" onchange=doRename()'+(RICH?' title="'+meta+'"':'')+'>';
+       ' transcripts · '+fmt(d.bytes)+(d.subs?' · '+d.subs+' subagent':'')+
+       (src&&r.cwd?' · '+esc(r.cwd):'');
+  const ttl='<input id=ttl value="'+esc(r.title)+'"'+
+       (src?' readonly title="'+meta+'"':' onchange=doRename()'+(RICH?' title="'+meta+'"':''))+'>';
   const fileops=
        '<select id=fmt title="File format for the download">'+
          '<option value=md>Markdown</option><option value=txt>Plain text</option>'+
          '<option value=json>JSON</option></select>'+
        '<button class=btn onclick=doExport() title="Choose where to save the whole conversation. Currently defaults to '+
          esc((S.exportDir||"~/Downloads").replace(/^\/Users\/[^\/]+/,"~"))+'">Download</button>'+
-       '<button class="btn d" onclick=doDelete()>Delete</button>';
+       (src?'':'<button class="btn d" onclick=doDelete()>Delete</button>');
   $("#read").innerHTML=
    '<div id=rhead'+(RICH?' class=x':'')+'>'+
      (RICH?'<button class=xbtn onclick=closeChat() title="Close chat (Ctrl+W)" aria-label="Close chat">'+
@@ -743,10 +871,12 @@ function drawRead(d){
        // Windows: the file actions share the title's row (the details live in its
        // tooltip), and the row below is only about sending the chat
        '<div class=trow>'+ttl+'<span class="tools fops">'+fileops+'</span></div>'+
-       '<div class=tools>'+sendGroup(others)+'</div>'
+       '<div class=tools>'+folderChip(r,src)+'<span class=vsep></span>'+
+         (src?importGroup(others):sendGroup(others))+'</div>'
      :ttl+'<div class=meta>'+meta+'</div>'+
+       '<div class=tools>'+folderChip(r,src)+'</div>'+
        '<div class=tools>'+
-       (others.length?'<select id=tgt>'+others.map(x=>'<option value="'+key(x)+'">'+esc(label(x))+'</option>').join("")+
+       (others.length&&!src?'<select id=tgt>'+others.map(x=>'<option value="'+key(x)+'">'+esc(label(x))+'</option>').join("")+
         '</select><button class="btn p" onclick=btnSend(false)>Copy →</button>'+
         '<button class=btn onclick=btnSend(true)>Move →</button>':'')+
        '<span style="flex:1"></span>'+fileops+'</div>')+

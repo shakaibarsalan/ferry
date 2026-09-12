@@ -6,12 +6,22 @@
   ./ferry-cli.py list                  print accounts + chat counts
   ./ferry-cli.py vault                 archive every chat + transcript into ~/.ferry
   ./ferry-cli.py export <text|id> [md|txt|json]   save a chat to ~/Downloads
+  ./ferry-cli.py import <text|id> <account>       add a CLI or VS Code chat
+                                                  to an account
+  ./ferry-cli.py folder <text|id> <path>          point a chat at the folder
+                                                  it belongs to
+  ./ferry-cli.py cursor                           list Cursor's conversations
+  ./ferry-cli.py cursor-import <text|id> <account>  convert one into a Claude chat
+
+Chats started in the CLI or in VS Code have no per-account record, so Claude
+lists them nowhere. "list" shows them under the accounts; "import" gives one a
+record in the account you name. The transcript itself is never moved.
 
 Writes are refused while the Claude desktop app is running; every mutation
 snapshots the affected file into the vault first.
 """
 import json, os, re, shutil, sys, glob, subprocess, tempfile, threading, webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HOME  = (os.environ.get("USERPROFILE") or os.path.expanduser("~")) \
@@ -187,10 +197,21 @@ def known_profiles(found):
     return known
 
 def read_rec(path):
+    # a session no account owns has no record on disk: describe it from its
+    # own transcript, so everything that reads a chat can read one of those too
+    if str(path).endswith(".jsonl") and under(PROJ, str(path)):
+        return source_rec(path)
     # explicit utf-8: Windows defaults to the ANSI codepage, which fails on
     # non-ASCII titles and silently drops the chat
     try: return json.load(open(path, encoding="utf-8"))
     except Exception: return None
+
+def owned(path):
+    """Renaming, copying or deleting needs a record an account owns. A bare
+    transcript has none, and is never the thing to write to."""
+    if str(path).endswith(".jsonl"):
+        raise RuntimeError("this chat is not in an account yet - import it first")
+    return path
 
 def transcripts_for(rec):
     """Every transcript file that makes up one chat: current + prior + subagents."""
@@ -209,10 +230,187 @@ def transcripts_for(rec):
                     "subagents": [{"path":s,"size":os.path.getsize(s)} for s in subs]})
     return out
 
+# ---------- sessions no account claims ----------
+# Claude Code writes a transcript for every session it runs, wherever it runs:
+# the CLI, the VS Code extension and the desktop app all append to the same
+# ~/.claude/projects tree. Only the desktop app also writes the small
+# per-account record Ferry lists, so a chat started in the CLI or in VS Code is
+# on disk and belongs to nobody - readable, but invisible to every account.
+# These are listed as read-only sources. A chat can be imported out of one into
+# an account; nothing is ever written back into them.
+
+SOURCES = {"cli":            ("cli",     "Claude Code CLI"),
+           "claude-vscode":  ("vscode",  "VS Code"),
+           "claude-desktop": ("desktop", "Desktop, no record"),
+           "cursor":         ("cursor",  "Cursor")}
+INDEX = f"{VAULT}/sessions.json"
+# bumped whenever what is read out of a transcript changes, so an index written
+# by an older Ferry is re-read rather than believed
+INDEX_V = 3
+# fields that describe the account and its environment rather than the chat
+INHERIT = ("envScopeId", "permissionMode", "effort", "chromePermissionMode",
+           "remoteControlAutoEligible", "classifierSummaryEnabled")
+
+def title_from(text):
+    """A chat's name, taken from the first thing the person typed. The desktop
+    app titles its own chats in a few words, so a whole opening prompt would
+    tower over them in the list: keep the first sentence, and cut that at a
+    word. A full stop only ends a sentence when a space follows it, or
+    "github.com" and "ocid1.tenancy.oc1" would each end one."""
+    one = " ".join(text.split())
+    s = one
+    for i, ch in enumerate(one):
+        if ch in ".!?":
+            if i + 1 >= len(one): break        # one sentence: it keeps its mark
+            if one[i+1] == " ":
+                if 12 <= i <= 70: s = one[:i]
+                break
+    if len(s) <= 60: return s
+    cut = s[:60]
+    i = cut.rfind(" ")
+    return (cut[:i] if i >= 30 else cut.rstrip()) + "…"
+
+def iso_ms(s):
+    """Transcripts date every line in ISO-8601 UTC; records count milliseconds."""
+    try:
+        d  = datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        ms = int(s[20:23]) if len(s) >= 23 and s[19] == "." else 0
+        return int(d.timestamp()*1000) + ms
+    except Exception:
+        return None
+
+def read_session(path):
+    """Everything a transcript says about itself, in one pass: which surface
+    wrote it, where it ran, when it started and stopped, how many turns it took
+    and what to call it. Lines over a megabyte are tool output, never metadata,
+    so they are never parsed - that keeps a 90 MB transcript cheap to read."""
+    try: st = os.stat(path)
+    except Exception: return None
+    info = {"v": INDEX_V, "entrypoint":"", "cwd":"", "version":"", "branch":"", "model":"",
+            "title":"", "turns":0, "size": st.st_size}
+    first = last = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if len(line) > (1 << 20): continue
+                try: d = json.loads(line)
+                except Exception: continue
+                ty = d.get("type")
+                if ty not in ("user", "assistant"): continue
+                for k, f in (("entrypoint","entrypoint"), ("cwd","cwd"),
+                             ("version","version"), ("branch","gitBranch")):
+                    if not info[k] and d.get(f): info[k] = d[f]
+                if ty == "assistant" and not info["model"]:
+                    info["model"] = ((d.get("message") or {}).get("model")) or ""
+                t = d.get("timestamp")
+                if t:
+                    if first is None: first = t
+                    if last is None or t > last: last = t
+                # a turn is a prompt the person typed: not a subagent's, and not
+                # the harness's own <command-name> and <system-reminder> lines
+                if ty == "user" and not d.get("isSidechain") and not d.get("isMeta"):
+                    c = (d.get("message") or {}).get("content")
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text","") for x in c
+                                     if isinstance(x, dict) and x.get("type") == "text")
+                    c = c.strip() if isinstance(c, str) else ""
+                    # "[Request interrupted...]" is written by the harness when you
+                    # stop a tool, not typed: neither a turn nor a name for the chat
+                    if c and not c.startswith(("<", "[Request interrupted")):
+                        info["turns"] += 1
+                        if not info["title"]: info["title"] = title_from(c)
+    except Exception: pass
+    mt = int(st.st_mtime * 1000)
+    info["title"]   = info["title"] or "(untitled)"
+    info["created"] = iso_ms(first or "") or mt
+    info["last"]    = iso_ms(last or "") or mt
+    return info
+
+def session_info(cache, path, state):
+    """Reading every unclaimed transcript on every scan would mean re-reading
+    hundreds of megabytes to learn nothing new, so what each one said about
+    itself is kept in the vault and re-read only when the file changes."""
+    try: st = os.stat(path)
+    except Exception: return None
+    hit = cache.get(path)
+    if (hit and hit.get("v") == INDEX_V
+            and hit.get("size") == st.st_size and hit.get("mtime") == int(st.st_mtime)):
+        return hit
+    info = read_session(path)
+    if not info: return None
+    info["mtime"] = int(st.st_mtime)
+    cache[path] = info
+    state["dirty"] = True
+    return info
+
+def subagents_of(d, sid):
+    subs = glob.glob(f"{d}/{sid}/subagents/*.jsonl")
+    return len(subs), sum(os.path.getsize(s) for s in subs if os.path.exists(s))
+
+def source_rec(path):
+    """The record a CLI or VS Code session would have, described from the
+    transcript itself. The same shape the rest of the tool already reads."""
+    info = read_session(path)
+    if not info: raise RuntimeError("transcript unreadable")
+    sid = os.path.splitext(os.path.basename(path))[0]
+    kind, name = SOURCES.get(info["entrypoint"], ("other", "Other sessions"))
+    return {"sessionId": None, "cliSessionId": sid, "title": info["title"],
+            "cwd": info["cwd"], "model": info["model"],
+            "createdAt": info["created"], "lastActivityAt": info["last"],
+            "completedTurns": info["turns"], "isArchived": False,
+            "gitBranch": info["branch"], "cliVersion": info["version"],
+            "source": kind, "sourceName": name}
+
+def source_scopes(claimed):
+    """Every transcript no account's record claims, grouped by the surface that
+    wrote it and shaped like an account scope so the rest of the tool can list it."""
+    cache, state, groups, live = session_index(), {"dirty": False}, {}, set()
+    for path in glob.glob(f"{PROJ}/*/*.jsonl"):
+        sid = os.path.splitext(os.path.basename(path))[0]
+        live.add(path)
+        if sid in claimed: continue
+        info = session_info(cache, path, state)
+        if not info: continue
+        # a session the Agent SDK ran is not a chat anyone had: the prompts came
+        # from a program, so it is left where it is
+        if info["entrypoint"] in ("sdk-cli", "sdk"): continue
+        nsub, subb = subagents_of(os.path.dirname(path), sid)
+        kind, name = SOURCES.get(info["entrypoint"], ("other", "Other sessions"))
+        g = groups.setdefault(kind, {
+            "acct": f"source:{kind}", "org": "source", "kind": "source",
+            "source": kind, "sourceName": name, "chats": [], "deleted": [],
+            "connectors": {}, "cwds": {}, "isCurrent": False, "label": "", "profile": None})
+        g["chats"].append({
+            "id": "local_" + sid, "sid": sid, "title": info["title"],
+            "cwd": info["cwd"], "model": info["model"], "created": info["created"],
+            "last": info["last"], "turns": info["turns"], "archived": False,
+            "forkedFrom": None, "files": 1, "subs": nsub,
+            "bytes": info["size"] + subb, "missing": 0, "absent": 0,
+            "branch": info["branch"], "version": info["version"],
+            "source": kind, "path": path})
+    # forget transcripts retention has since pruned, so the index does not grow
+    # forever on a machine that churns through sessions
+    for stale in [k for k in cache if k not in live]:
+        cache.pop(stale, None); state["dirty"] = True
+    if state["dirty"]:
+        try:
+            os.makedirs(VAULT, exist_ok=True)
+            json.dump(cache, open(INDEX, "w", encoding="utf-8"))
+        except Exception: pass
+    out = list(groups.values())
+    for g in out: g["chats"].sort(key=lambda c: c["last"] or 0, reverse=True)
+    out.sort(key=lambda g: -(max([c["last"] or 0 for c in g["chats"]], default=0)))
+    return out
+
+def session_index():
+    try: return json.load(open(INDEX, encoding="utf-8"))
+    except Exception: return {}
+
 def scan():
     """Full inventory: every account/org scope, its chats and tombstones."""
     cur, labs, profs = current_account(), labels(), profiles()
     scopes = {}
+    claimed = set()          # transcripts some account already answers for
     for f in glob.glob(f"{SESS}/*/*/local_*.json"):
         acct, org = scope_of(f)
         rec = read_rec(f)
@@ -223,6 +421,7 @@ def scan():
                                     "label":labs.get(acct,""),
                                     "profile":profs.get(acct)})
         tr = transcripts_for(rec)
+        claimed.update(t["id"] for t in tr if t.get("id"))
         s["chats"].append({
             "id": rec.get("sessionId"), "title": rec.get("title") or "(untitled)",
             "cwd": rec.get("cwd",""), "model": rec.get("model",""),
@@ -250,7 +449,14 @@ def scan():
     for s in scopes.values():
         s["chats"].sort(key=lambda c: c["last"] or 0, reverse=True)
         s["deleted"].sort(key=lambda d: d["when"] or 0, reverse=True)
-    return {"exportDir": export_dir(), "scopes": sorted(scopes.values(), key=lambda s: -(max([c["last"] or 0 for c in s["chats"]], default=0)),),
+    ordered = sorted(scopes.values(),
+                     key=lambda s: -(max([c["last"] or 0 for c in s["chats"]], default=0)))
+    # CLI and VS Code sessions come after the accounts: they are where chats are
+    # imported from, not an account you can send one to
+    sources = source_scopes(claimed)
+    cs = cursor_scope()
+    if cs: sources.append(cs)
+    return {"exportDir": export_dir(), "scopes": ordered + sources,
             "current": cur, "appRunning": app_running(), "vault": VAULT}
 
 # ---------- mutations ----------
@@ -270,7 +476,7 @@ def guard(force=False):
 def scope_dir(acct, org): return f"{SESS}/{acct}/{org}"
 
 def op_copy(src_path, dst_acct, dst_org, move=False, force=False):
-    guard(force)
+    guard(force); owned(src_path)
     rec = read_rec(src_path)
     if not rec: raise RuntimeError("source chat unreadable")
     sid = rec["sessionId"]
@@ -288,8 +494,98 @@ def op_copy(src_path, dst_acct, dst_org, move=False, force=False):
         open(f"{sd}/deleted_{sid[len('local_'):]}","w").write(str(int(datetime.now().timestamp()*1000)))
     return {"ok": True, "wrote": dst, "moved": move}
 
-def op_rename(path, title, force=False):
+def template_record(d):
+    """The newest record the app itself wrote in this account, to copy the
+    fields that describe the account rather than the chat."""
+    recs = glob.glob(f"{d}/local_*.json")
+    if not recs: return {}
+    try: return json.load(open(max(recs, key=os.path.getmtime), encoding="utf-8")) or {}
+    except Exception: return {}
+
+def op_import(path, acct, org, force=False):
+    """Give a CLI or VS Code session the per-account record it never had, so an
+    account claims it and it becomes an ordinary chat: listed by Claude, and
+    from here on copyable, movable and deletable like any other. The transcript
+    is not touched, so the session stays resumable where it came from."""
     guard(force)
+    if not (str(path).endswith(".jsonl") and under(PROJ, str(path))):
+        raise RuntimeError(f"path is outside the projects folder\n  path: {path}\n  root: {PROJ}")
+    info = read_session(path)
+    if not info: raise RuntimeError("transcript unreadable")
+    if not info["cwd"]: raise RuntimeError("this transcript does not say which folder it ran in")
+    sid = os.path.splitext(os.path.basename(path))[0]
+    d = scope_dir(acct, org)
+    if not os.path.isdir(d): raise RuntimeError("that account has no folder on this machine")
+    # The id the chat keeps for good, derived from the session it already has:
+    # importing the same session twice updates one record instead of making a
+    # second, and a later copy to another account carries the same id.
+    rid = "local_" + sid
+    rec = {"sessionId": rid, "cliSessionId": sid,
+           "cwd": info["cwd"], "originCwd": info["cwd"],
+           "title": info["title"], "titleSource": "auto",
+           "createdAt": info["created"], "lastActivityAt": info["last"],
+           "lastFocusedAt": info["last"], "completedTurns": info["turns"],
+           "isArchived": False}
+    if info["model"]: rec["model"] = info["model"]
+    t = template_record(d)
+    for k in INHERIT:
+        if t.get(k) is not None: rec[k] = t[k]
+    dst = f"{d}/{rid}.json"
+    snapshot(dst, "import")
+    json.dump(rec, open(dst, "w", encoding="utf-8"), indent=1)
+    tomb = f"{d}/deleted_{sid}"
+    if os.path.exists(tomb): snapshot(tomb, "undelete"); os.remove(tomb)
+    return {"ok": True, "wrote": dst, "id": rid,
+            "title": info["title"], "turns": info["turns"]}
+
+def is_scratch(cwd):
+    """A chat started without picking a folder runs in a workspace the app makes
+    for it, and shows in Claude as having no folder at all."""
+    return (not cwd) or "scratch-workspaces" in cwd.lower()
+
+def relink(src, dst):
+    """Put one transcript under a second name so it can be found from another
+    folder too. A hard link, not a copy: one file, two names, not a byte
+    duplicated, and the folder it came from keeps working. Only a volume that
+    refuses links falls back to copying. Returns (linked, copied)."""
+    if os.path.exists(dst) or not os.path.exists(src): return (0, 0)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try: os.link(src, dst); return (1, 0)
+    except Exception: pass
+    try: shutil.copy2(src, dst); return (0, 1)
+    except Exception: return (0, 0)
+
+def op_set_folder(path, folder, force=False):
+    """Point a chat at a folder. Its cwd is two things at once: the folder Claude
+    names in its header and resumes in, and where the conversation is looked up.
+    So changing only the cwd would show the new folder and lose the conversation
+    with it - every transcript has to be findable under the new name too."""
+    guard(force); owned(path)
+    rec = read_rec(path)
+    if not rec: raise RuntimeError("chat unreadable")
+    was    = rec.get("cwd") or ""
+    folder = (folder or "").strip()
+    if not folder: raise RuntimeError("say which folder to point it at")
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder): raise RuntimeError(f"no such folder: {folder}")
+    if folder == was: return {"ok": True, "unchanged": True, "cwd": folder}
+
+    dst_dir = project_dir(folder)
+    os.makedirs(dst_dir, exist_ok=True)
+    linked = copied = 0
+    for t in transcripts_for(rec):
+        l, c = relink(t["path"], f"{dst_dir}/{t['id']}.jsonl")
+        linked += l; copied += c
+        for s in glob.glob(f"{os.path.dirname(t['path'])}/{t['id']}/subagents/*.jsonl"):
+            l, c = relink(s, f"{dst_dir}/{t['id']}/subagents/{os.path.basename(s)}")
+            linked += l; copied += c
+    snapshot(path, "folder")
+    rec["cwd"] = folder; rec["originCwd"] = folder
+    json.dump(rec, open(path, "w", encoding="utf-8"), indent=1)
+    return {"ok": True, "cwd": folder, "was": was, "linked": linked, "copied": copied}
+
+def op_rename(path, title, force=False):
+    guard(force); owned(path)
     rec = read_rec(path)
     if not rec: raise RuntimeError("chat unreadable")
     snapshot(path, "rename")
@@ -298,7 +594,7 @@ def op_rename(path, title, force=False):
     return {"ok": True, "title": title}
 
 def op_delete(path, force=False):
-    guard(force)
+    guard(force); owned(path)
     rec = read_rec(path); sid = rec["sessionId"]
     snapshot(path, "delete")
     d = os.path.dirname(path)
@@ -410,6 +706,7 @@ def page():
     return html.encode()
 
 def chat_detail(path):
+    if str(path).startswith("cursor:"): return cursor_detail(str(path)[len("cursor:"):])
     rec = read_rec(path)
     if not rec: raise RuntimeError("chat unreadable")
     tr = transcripts_for(rec)
@@ -425,6 +722,11 @@ OPS = {
     "chat_detail":   lambda path, **k: chat_detail(path),
     "export_chat":   lambda **k: op_export(**k),
     "copy_chat":     lambda path, acct, org, mv=False, **k: op_copy(path, acct, org, move=mv),
+    "import_session":lambda path, acct, org, **k: (
+        op_cursor_import(str(path)[len("cursor:"):], acct, org)
+        if str(path).startswith("cursor:") else op_import(path, acct, org)),
+    # the browser has no native folder panel, so the UI asks for the path itself
+    "set_folder":    lambda path, folder=None, **k: op_set_folder(path, folder),
     "rename_chat":   lambda path, title, **k: op_rename(path, title),
     "delete_chat":   lambda path, **k: op_delete(path),
     "undelete_chat": lambda acct, org, id, **k: op_undelete(acct, org, id),
@@ -454,9 +756,12 @@ class H(BaseHTTPRequestHandler):
         cmd, args = req.get("cmd"), (req.get("args") or {})
         fn = OPS.get(cmd)
         if not fn: return self._send({"__error": f"unknown command {cmd!r}"}, 400)
-        for key in ("path",):
-            if args.get(key) and not under(SESS, str(args[key])):
-                return self._send({"__error": f"path is outside the sessions folder\n  path: {args[key]}\n  root: {SESS}"}, 400)
+        # a transcript is a legitimate target now: it is what a source chat is
+        p = args.get("path")
+        if p and not (str(p).startswith("cursor:") or under(SESS, str(p)) or
+                      (str(p).endswith(".jsonl") and under(PROJ, str(p)))):
+            return self._send({"__error": f"path is outside the sessions and projects folders"
+                                          f"\n  path: {p}\n  roots: {SESS}\n         {PROJ}"}, 400)
         try:
             return self._send(fn(**args))
         except TypeError as e:
@@ -525,7 +830,8 @@ def op_export(path, fmt="md", **_):
     if not rec: raise RuntimeError("chat unreadable")
     body, msgs = build_export(rec, fmt)
     ext = fmt if fmt in ("md","txt","json") else "md"
-    short = rec["sessionId"][len("local_"):][:8]
+    # a session no account owns has no record id yet: name it after the one it has
+    short = (rec.get("sessionId") or "local_" + (rec.get("cliSessionId") or ""))[len("local_"):][:8]
     d = export_dir(); os.makedirs(d, exist_ok=True)
     dest = f"{d}/{slug(rec.get('title','chat'))}-{short}.{ext}"
     open(dest,"w",encoding="utf-8").write(body)
@@ -560,6 +866,15 @@ def cmd_list():
     st = scan()
     print(f"vault: {VAULT}   app running: {'YES (writes blocked)' if st['appRunning'] else 'no'}\n")
     for s in st["scopes"]:
+        if s.get("kind") == "source":
+            # chats Claude Code wrote outside the desktop app, owned by nobody
+            print(f"{s['sourceName']}   (not in an account)")
+            print(f"   {len(s['chats'])} chats - add one with: "
+                  f"{os.path.basename(__file__)} import <text|id> <account>")
+            for c in s["chats"][:5]:
+                print(f"     - {c['title'][:58]:60} {ts(c['last'])}  [{c['sid'][:8]}]")
+            print()
+            continue
         who = s["profile"]["email"] if s["profile"] else (s["label"] or "unidentified")
         cur = "  <= CURRENT" if s["isCurrent"] else ""
         print(f"{s['acct'][:8]} / {s['org'][:8]}  {who}{cur}")
@@ -669,10 +984,13 @@ def _demo_transcript(title, model, turns, ms):
 
 def demo_setup():
     """Build the synthetic tree and point every root at it."""
-    global CLAUDE, SESS, PROJ, CFG, IDB, VAULT, LABELS, PREFS
+    global CLAUDE, SESS, PROJ, CFG, IDB, VAULT, LABELS, PREFS, CURSOR, INDEX
     global app_running, current_account, profiles
 
     root   = tempfile.mkdtemp(prefix="ferry-demo-")
+    # Cursor's own database is the one root that is not synthetic, and a demo
+    # that showed real conversation titles would defeat the point of one.
+    CURSOR = os.path.join(root, "no-cursor-in-a-demo")
     CLAUDE = os.path.join(root, "Claude")
     SESS   = os.path.join(CLAUDE, "claude-code-sessions")
     PROJ   = os.path.join(root, "dot-claude", "projects")
@@ -681,6 +999,7 @@ def demo_setup():
     VAULT  = os.path.join(root, "ferry-vault")
     LABELS = os.path.join(VAULT, "labels.json")
     PREFS  = os.path.join(VAULT, "prefs.json")
+    INDEX  = os.path.join(VAULT, "sessions.json")   # follows the vault
 
     for a, o, *_ in DEMO_ACCTS:
         os.makedirs(os.path.join(SESS, a, o), exist_ok=True)
@@ -739,6 +1058,325 @@ def demo_setup():
     profiles        = lambda: prof
     return root
 
+def cmd_import(query, who):
+    """Add a CLI or VS Code chat to an account. The chat is named by title or
+    session id, the account by email, nickname or the start of its uuid."""
+    st = scan()
+    hits = [(c, s) for s in st["scopes"] if s.get("kind") == "source"
+                   for c in s["chats"]
+                   if query.lower() in c["title"].lower() or c["sid"].startswith(query)]
+    if not hits: return print(f"no chat outside an account matching {query!r}")
+    if len({c["sid"] for c, _ in hits}) > 1:
+        print("matches more than one chat:")
+        for c, s in hits: print(f"   {c['title'][:58]:60} [{c['sid'][:8]}]  {s['sourceName']}")
+        return
+    chat, src = hits[0]
+
+    w = who.lower()
+    accounts = [s for s in st["scopes"] if s.get("kind") != "source"]
+    want = [s for s in accounts
+            if w in ((s["profile"] or {}).get("email","") or "").lower()
+            or w in (s["label"] or "").lower() or s["acct"].lower().startswith(w)]
+    if not want:
+        print(f"no account matching {who!r}. Accounts on this machine:")
+        for s in accounts:
+            print(f"   {s['acct'][:8]}  {(s['profile'] or {}).get('email') or s['label'] or '-'}")
+        return
+    if len(want) > 1:
+        print("matches more than one account:")
+        for s in want: print(f"   {s['acct'][:8]}  {(s['profile'] or {}).get('email') or s['label'] or '-'}")
+        return
+    t = want[0]
+    r = op_import(chat["path"], t["acct"], t["org"])
+    name = (t["profile"] or {}).get("email") or t["label"] or t["acct"][:8]
+    print(f"added {r['title'][:58]!r} ({r['turns']} turns) from {src['sourceName']} to {name}")
+    print(f"  -> {r['wrote']}")
+
+def cmd_folder(query, folder):
+    """Point a chat at the folder it belongs to."""
+    hits = []
+    for f in glob.glob(f"{SESS}/*/*/local_*.json"):
+        rec = read_rec(f)
+        if not rec: continue
+        if query.lower() in (rec.get("title","")).lower() or query in (rec.get("sessionId") or ""):
+            hits.append((f, rec))
+    if not hits: return print(f"no chat matching {query!r}")
+    if len({r["sessionId"] for _, r in hits}) > 1:
+        print("matches more than one chat:")
+        for f, r in hits: print(f"   {r.get('title','')[:58]:60} [{r['sessionId'][6:14]}]")
+        return
+    f, rec = hits[0]
+    r = op_set_folder(f, folder)
+    if r.get("unchanged"): return print("already in that folder")
+    print(f"{rec.get('title','(untitled)')[:58]}")
+    print(f"  was: {r['was'] or '(no folder)'}")
+    print(f"  now: {r['cwd']}")
+    print(f"  transcripts: {r['linked']} linked, {r['copied']} copied")
+
+# ---------- Cursor ----------
+# Cursor is a separate application with a storage of its own: one SQLite file
+# holding every conversation, not a folder of transcripts. A chat is a row in
+# composerHeaders, an ordered list of bubble ids in composerData:<id>, and one
+# bubbleId:<chat>:<bubble> row per message. Nothing about it resembles the
+# JSONL Claude Code appends, so a chat cannot be moved between them - it has to
+# be converted, and the conversion only goes one way. Writing into Cursor's
+# database would mean inserting rows into a live 1 GB file that Cursor holds
+# open, where a mistake costs every conversation in it, so Ferry never does.
+# Every read here is mode=ro.
+
+if sys.platform == "win32":
+    CURSOR = os.path.join(os.environ.get("APPDATA", ""), "Cursor", "User")
+elif sys.platform == "darwin":
+    CURSOR = f"{HOME}/Library/Application Support/Cursor/User"
+else:
+    CURSOR = f"{HOME}/.config/Cursor/User"
+
+def cursor_db():
+    p = os.path.join(CURSOR, "globalStorage", "state.vscdb")
+    return p if os.path.exists(p) else None
+
+def cursor_ro(path):
+    """Read-only, and never anything else."""
+    import sqlite3
+    return sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True)
+
+def cursor_folders():
+    """Which folder each Cursor workspace is: workspace.json names it as a URI."""
+    import urllib.parse
+    out = {}
+    for f in glob.glob(os.path.join(CURSOR, "workspaceStorage", "*", "workspace.json")):
+        try: j = json.load(open(f, encoding="utf-8"))
+        except Exception: continue
+        uri = j.get("folder") or ""
+        if not uri.startswith("file:///"): continue
+        p = urllib.parse.unquote(uri[len("file:///"):])
+        p = p.replace("/", os.sep) if sys.platform == "win32" else "/" + p
+        out[os.path.basename(os.path.dirname(f))] = p
+    return out
+
+def cursor_chats():
+    """Every Cursor conversation that has anything in it. Most headers are empty
+    shells left behind by windows that were opened and closed."""
+    db = cursor_db()
+    if not db: return []
+    ws, out = cursor_folders(), []
+    c = cursor_ro(db)
+    try:
+        rows = list(c.execute("""select composerId, workspaceId, createdAt, lastUpdatedAt,
+                                        isArchived, isSubagent, value
+                                 from composerHeaders order by lastUpdatedAt desc"""))
+    except Exception:
+        return []
+    for cid, wid, created, updated, arch, sub, val in rows:
+        if sub: continue                      # a subagent's own side conversation
+        r = c.execute("select value from cursorDiskKV where key=?",
+                      ("composerData:" + cid,)).fetchone()
+        if not r: continue
+        try: data = json.loads(r[0]) or {}
+        except Exception: continue
+        heads = data.get("fullConversationHeadersOnly") or []
+        if not heads: continue
+        # most bubbles are tool calls with nothing to read; each header says
+        # whether its bubble has text, so how much was said can be counted
+        # without opening three thousand rows
+        said = sum(1 for h in heads if (h.get("grouping") or {}).get("hasText")) or len(heads)
+        try: name = (json.loads(val) or {}).get("name") or ""
+        except Exception: name = ""
+        out.append({"id": cid, "title": name or "(unnamed)",
+                    "folder": ws.get(str(wid), ""), "created": created,
+                    "last": updated, "archived": bool(arch),
+                    "bubbles": len(heads), "said": said})
+    return out
+
+def _tool_line(t):
+    """One tool call, said in a line. Cursor keeps the arguments as raw JSON;
+    the path or command in them is the part worth reading."""
+    name = t.get("name") or t.get("tool") or "tool"
+    hint = ""
+    try:
+        a = json.loads(t.get("rawArgs") or "{}")
+        if isinstance(a, dict):
+            for k in ("path", "target_file", "file", "command", "query", "pattern",
+                      "globPattern", "targetDirectory", "toolName", "explanation"):
+                if a.get(k): hint = str(a[k]); break
+            if not hint:
+                # whatever is left, minus Cursor's own bookkeeping - call ids say
+                # nothing about what the tool did and carry newlines of their own
+                rest = {k: v for k, v in a.items()
+                        if k not in ("toolCallId", "modelCallId", "toolIndex", "toolCallBinary")}
+                if rest: hint = json.dumps(rest)
+    except Exception: pass
+    hint = " ".join(str(hint).split())            # a tool call is one line
+    return f"-> {name}({hint[:120]})" if hint else f"-> {name}()"
+
+def cursor_messages(cid):
+    """One Cursor conversation as plain turns, oldest first.
+
+    Most bubbles carry no prose at all - in a 4,563 bubble chat only a couple of
+    hundred do, and three thousand are tool calls. Dropping those would throw
+    away what the conversation actually did, so a run of them is folded into the
+    message before it as one line each. They are written as text, not as
+    tool_use blocks: a tool_use has to be answered by a tool_result or the
+    conversation is malformed, and there is nothing here to answer it with."""
+    db = cursor_db()
+    if not db: return []
+    c = cursor_ro(db)
+    r = c.execute("select value from cursorDiskKV where key=?", ("composerData:" + cid,)).fetchone()
+    if not r: return []
+    heads = (json.loads(r[0]) or {}).get("fullConversationHeadersOnly") or []
+    out, pending = [], []
+
+    def flush(ts):
+        if not pending: return
+        out.append({"role": "assistant", "text": "\n".join(pending), "t": ts})
+        pending.clear()
+
+    for h in heads:
+        b = c.execute("select value from cursorDiskKV where key=?",
+                      ("bubbleId:%s:%s" % (cid, h.get("bubbleId")),)).fetchone()
+        if not b: continue
+        try: d = json.loads(b[0]) or {}
+        except Exception: continue
+        ts = h.get("createdAt") or d.get("createdAt") or ""
+        text = (d.get("text") or "").strip()
+        role = "user" if d.get("type") == 1 else "assistant"
+        if text:
+            if role == "user": flush(ts)
+            elif pending: text = "\n".join(pending) + "\n\n" + text; pending.clear()
+            out.append({"role": role, "text": text, "t": ts})
+        elif d.get("toolFormerData"):
+            pending.append(_tool_line(d["toolFormerData"]))
+    flush(out[-1]["t"] if out else "")
+    return out
+
+def write_transcript(path, msgs, cwd, sid):
+    """A Claude Code transcript, written from turns that came from somewhere
+    else. The shape is the one Claude Code appends: one JSON object a line,
+    each linked to the one before it. entrypoint says where it really came from
+    so nothing later mistakes it for a session Claude Code ran itself."""
+    import uuid as _uuid
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    prev = None
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for m in msgs:
+            u = str(_uuid.uuid4())
+            fh.write(json.dumps({
+                "parentUuid": prev, "isSidechain": False, "userType": "external",
+                "type": m["role"], "message": {"role": m["role"], "content": m["text"]},
+                "uuid": u, "timestamp": m["t"], "cwd": cwd, "sessionId": sid,
+                "gitBranch": "", "entrypoint": "cursor",
+            }, ensure_ascii=False) + "\n")
+            prev = u
+    return path
+
+def op_cursor_import(cid, acct, org, force=False):
+    """Convert one Cursor conversation into a Claude chat.
+
+    This is the one place Ferry writes a transcript rather than only the little
+    record beside it, because there is no transcript to point at - Cursor keeps
+    its conversations in a database. The file is named after the Cursor
+    conversation, so converting the same chat twice rewrites the one file
+    instead of leaving a second copy."""
+    guard(force)
+    hit = [x for x in cursor_chats() if x["id"] == cid or x["id"].startswith(cid)]
+    if not hit: raise RuntimeError(f"no Cursor chat {cid!r}")
+    chat = hit[0]
+    if not chat["folder"]:
+        raise RuntimeError("that Cursor chat has no folder on this machine")
+    if not os.path.isdir(scope_dir(acct, org)):
+        raise RuntimeError("that account has no folder on this machine")
+    msgs = cursor_messages(chat["id"])
+    if not msgs: raise RuntimeError("that Cursor chat has nothing readable in it")
+
+    dst = os.path.join(project_dir(chat["folder"]), chat["id"] + ".jsonl")
+    write_transcript(dst, msgs, chat["folder"], chat["id"])
+    rec = op_import(dst, acct, org, force=force)
+    # the record's title comes from the first prompt; Cursor already named it
+    if chat["title"] and chat["title"] != "(unnamed)":
+        op_rename(rec["wrote"], chat["title"], force=force)
+        rec["title"] = chat["title"]
+    rec["messages"] = len(msgs)
+    rec["transcript"] = dst
+    return rec
+
+def cursor_scope():
+    """Cursor's conversations as one more source to import from. They have no
+    transcript to point at until one is written, so they are addressed by
+    "cursor:<conversation id>" rather than by a path."""
+    chats = cursor_chats()
+    if not chats: return None
+    out = [{"id": "local_" + c["id"], "sid": c["id"], "title": c["title"],
+            "cwd": c["folder"], "model": "", "created": c["created"], "last": c["last"],
+            "turns": c["said"], "archived": c["archived"], "forkedFrom": None,
+            "files": 1, "subs": 0, "bytes": 0, "missing": 0, "absent": 0,
+            "branch": "", "version": "", "source": "cursor",
+            "path": "cursor:" + c["id"]} for c in chats]
+    out.sort(key=lambda c: c["last"] or 0, reverse=True)
+    return {"acct": "source:cursor", "org": "source", "kind": "source",
+            "source": "cursor", "sourceName": "Cursor", "chats": out,
+            "deleted": [], "connectors": {}, "cwds": {}, "isCurrent": False,
+            "label": "", "profile": None}
+
+def cursor_detail(cid):
+    """A Cursor chat read straight out of Cursor, before anything is written."""
+    hit = [x for x in cursor_chats() if x["id"] == cid]
+    if not hit: raise RuntimeError("no such Cursor chat")
+    chat = hit[0]
+    msgs = [{"role": m["role"], "t": (m["t"] or "")[:16], "text": m["text"], "tools": []}
+            for m in cursor_messages(cid)]
+    rec = {"sessionId": None, "cliSessionId": cid, "title": chat["title"],
+           "cwd": chat["folder"], "model": "", "createdAt": chat["created"],
+           "lastActivityAt": chat["last"], "completedTurns": len(msgs),
+           "isArchived": chat["archived"], "source": "cursor", "sourceName": "Cursor"}
+    return {"rec": rec, "files": [], "source": "cursor", "sourceName": "Cursor",
+            "bytes": sum(len(m["text"]) for m in msgs), "subs": 0, "msgs": msgs}
+
+def cmd_cursor():
+    if not cursor_db():
+        return print(f"no Cursor storage here\n  looked in: {CURSOR}")
+    chats = cursor_chats()
+    if not chats: return print("Cursor is installed but has no conversations with anything in them")
+    by = {}
+    for x in chats: by.setdefault(x["folder"] or "(no folder)", []).append(x)
+    print(f"{len(chats)} Cursor chats   ({cursor_db()})\n")
+    for folder, xs in by.items():
+        print(folder)
+        for x in xs:
+            print("  %-9s %-40s %4d turns of %5d bubbles  %s%s" %
+                  (x["id"][:8], x["title"][:40], x["said"], x["bubbles"], ts(x["last"]),
+                   "  (archived)" if x["archived"] else ""))
+        print()
+    print("add one to an account with:  ferry-cli.py cursor-import <id|text> <account>")
+
+def cmd_cursor_import(query, who):
+    chats = [x for x in cursor_chats()
+             if x["id"].startswith(query) or query.lower() in x["title"].lower()]
+    if not chats: return print(f"no Cursor chat matching {query!r}")
+    if len(chats) > 1:
+        print("matches more than one chat:")
+        for x in chats: print("   %-9s %s" % (x["id"][:8], x["title"][:58]))
+        return
+    chat = chats[0]
+    st = scan()
+    w = who.lower()
+    accounts = [s for s in st["scopes"] if s.get("kind") != "source"]
+    want = [s for s in accounts
+            if w in ((s["profile"] or {}).get("email", "") or "").lower()
+            or w in (s["label"] or "").lower() or s["acct"].lower().startswith(w)]
+    if len(want) != 1:
+        print("no single account matching %r. Accounts here:" % who)
+        for s in accounts:
+            print("   %-9s %s" % (s["acct"][:8], (s["profile"] or {}).get("email") or s["label"] or "-"))
+        return
+    t = want[0]
+    r = op_cursor_import(chat["id"], t["acct"], t["org"])
+    name = (t["profile"] or {}).get("email") or t["label"] or t["acct"][:8]
+    print(f"{r['title']!r}")
+    print(f"  {r['messages']} turns from Cursor -> {name}")
+    print(f"  folder     : {chat['folder']}")
+    print(f"  transcript : {r['transcript']}")
+    print(f"  record     : {r['wrote']}")
+
 def cmd_ui():
     srv = HTTPServer(("127.0.0.1", PORT), H)
     url = f"http://127.0.0.1:{PORT}/"
@@ -752,6 +1390,16 @@ if __name__ == "__main__":
     if   a=="list":  cmd_list()
     elif a=="vault": print(json.dumps(op_vault(), indent=1))
     elif a=="export": cmd_export(sys.argv[2], sys.argv[3] if len(sys.argv)>3 else "md")
+    elif a=="import":
+        if len(sys.argv) < 4: print("usage: ferry-cli.py import <text|id> <account>")
+        else: cmd_import(sys.argv[2], sys.argv[3])
+    elif a=="folder":
+        if len(sys.argv) < 4: print("usage: ferry-cli.py folder <text|id> <path>")
+        else: cmd_folder(sys.argv[2], sys.argv[3])
+    elif a=="cursor": cmd_cursor()
+    elif a=="cursor-import":
+        if len(sys.argv) < 4: print("usage: ferry-cli.py cursor-import <text|id> <account>")
+        else: cmd_cursor_import(sys.argv[2], sys.argv[3])
     elif a=="ui":
         if "--demo" in sys.argv:
             print(f"demo data -> {demo_setup()}")

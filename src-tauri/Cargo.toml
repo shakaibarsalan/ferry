@@ -15,6 +15,16 @@ regex = "1"
 walkdir = "2"
 tauri-plugin-dialog = "2"
 
+# Cursor keeps its conversations in a SQLite file rather than in transcripts, so
+# reading them means speaking SQLite. Bundled, because Windows has no system
+# libsqlite3 and a build must not depend on one being installed.
+#
+# Windows only, and deliberately so: it is the one dependency here that costs
+# anything - about 1 MB - and Cursor support has only been tested on Windows.
+# The macOS build takes neither the dependency nor the size.
+[target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [profile.release]
 opt-level = "s"
 lto = true
