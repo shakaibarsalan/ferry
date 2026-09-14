@@ -253,7 +253,7 @@ INDEX = f"{VAULT}/sessions.json"
 # bumped whenever what is read out of a transcript changes, so an index written
 # by an older Ferry is re-read rather than believed
 INDEX_V = 3
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.3"
 # fields that describe the account and its environment rather than the chat
 INHERIT = ("envScopeId", "permissionMode", "effort", "chromePermissionMode",
            "remoteControlAutoEligible", "classifierSummaryEnabled")
@@ -469,7 +469,7 @@ def scan():
     return {"exportDir": export_dir(), "scopes": ordered + sources,
             "current": cur, "appRunning": app_running(),
             "cursorRunning": cursor_running(), "vault": VAULT,
-            "version": APP_VERSION, "cursorLiveNote": CURSOR_LIVE_NOTE}
+            "version": APP_VERSION}
 
 # ---------- mutations ----------
 
@@ -717,6 +717,11 @@ def page():
         html = html.replace(anchor, SHIM + anchor, 1)
     return html.encode()
 
+def chat_full(path):
+    """The rest of a conversation chat_detail held back, asked for by the UI."""
+    if str(path).startswith("cursor:"): return cursor_full(str(path)[len("cursor:"):])
+    return chat_detail(path)          # a Claude chat arrives whole already
+
 def chat_detail(path):
     if str(path).startswith("cursor:"): return cursor_detail(str(path)[len("cursor:"):])
     rec = read_rec(path)
@@ -732,6 +737,7 @@ def chat_detail(path):
 OPS = {
     "scan":          lambda **k: scan(),
     "chat_detail":   lambda path, **k: chat_detail(path),
+    "chat_full":     lambda path, **k: chat_full(path),
     "export_chat":   lambda **k: op_export(**k),
     "copy_chat":     lambda path, acct, org, mv=False, **k: op_copy(path, acct, org, move=mv),
     "import_session":lambda path, acct, org, **k: (
@@ -744,7 +750,7 @@ OPS = {
     "undelete_chat": lambda acct, org, id, **k: op_undelete(acct, org, id),
     "set_label":     lambda acct, name, **k: (set_label(acct, name), {"ok": True})[1],
     "run_vault":     lambda **k: op_vault(),
-    "export_to_cursor": lambda path, live=False, **k: op_cursor_export(path, live=live),
+    "export_to_cursor": lambda path, **k: op_cursor_export(path),
 }
 
 class H(BaseHTTPRequestHandler):
@@ -1230,17 +1236,6 @@ def cursor_ro(path):
 
 CURSOR_BUSY_MS = 5000
 
-# What writing with Cursor open actually costs, in the words the user gets told.
-# state.vscdb is WAL and the write is one short BEGIN IMMEDIATE transaction, so
-# the file is not at risk. Two other things are, and neither is corruption:
-# Cursor reads composerHeaders straight from SQL but only when its own sentinel
-# key changes, and it has no way of noticing a change another process made - so
-# the row is on disk immediately and on screen only after the window reloads.
-# And Cursor's connection sets no busy_timeout, so while Ferry holds the write
-# lock Cursor's own writes fail outright instead of waiting.
-CURSOR_LIVE_NOTE = ("Cursor is open. The chat is written, and appears after you "
-                    "run Developer: Reload Window in Cursor.")
-
 def cursor_rw(path, busy_ms=CURSOR_BUSY_MS):
     """Read-write, and willing to wait. state.vscdb is WAL, so a reader never
     blocks a writer, but two writers still take turns. Cursor's own connection
@@ -1290,13 +1285,45 @@ def cursor_folders():
         out[os.path.basename(os.path.dirname(f))] = p
     return out
 
-def cursor_chats():
-    """Every Cursor conversation that has anything in it. Most headers are empty
-    shells left behind by windows that were opened and closed."""
-    db = cursor_db()
-    if not db: return []
-    ws, out = cursor_folders(), []
-    c = cursor_ro(db)
+def _cursor_chat_sql(narrow=""):
+    """The one query behind both the conversation list and a single
+    conversation, so a chat opened on its own is the chat that was in the list.
+    narrow is the extra predicate that picks one row.
+
+    The counting happens in SQLite. composerData keeps the only copy of the
+    bubble list and runs to 181 MB across these conversations, so carrying each
+    blob over here to count it cost a second on every list load; json_each walks
+    the same array in C and gives back two integers. The two joins are the
+    emptiness test as well, because a conversation with no bubbles contributes
+    no rows to group and falls out on its own.
+
+    The subagent filter is in SQL for the same reason: 3,509 of the 3,825 header
+    rows are a subagent's own side conversation, and reading their 5.9 MB of
+    value text only to drop it here was 5.9 MB read for nothing."""
+    # most bubbles are tool calls with nothing to read; each header says whether
+    # its bubble has text, so how much was said is counted without opening three
+    # thousand rows
+    return """select h.composerId, h.workspaceId, h.createdAt, h.lastUpdatedAt,
+                     h.isArchived, json_extract(h.value,'$.name'), count(*),
+                     sum(json_extract(e.value,'$.grouping.hasText')=1)
+                from composerHeaders h
+                join cursorDiskKV d on d.key='composerData:'||h.composerId
+                join json_each(d.value,'$.fullConversationHeadersOnly') e
+               where coalesce(h.isSubagent,0)=0 %s
+               group by h.composerId order by h.lastUpdatedAt desc""" % narrow
+
+def _cursor_chat_row(ws, row):
+    """One conversation row, however it was found."""
+    cid, wid, created, updated, arch, name, bubbles, said = row
+    return {"id": cid, "title": name or "(unnamed)",
+            "folder": ws.get(str(wid), ""), "created": created,
+            "last": updated, "archived": bool(arch),
+            "bubbles": bubbles, "said": said or bubbles}
+
+def _cursor_chats_slow(c, ws):
+    """One conversation at a time, with the blob parsed here rather than in
+    SQLite, so a conversation whose blob will not parse is the only thing lost."""
+    out = []
     try:
         rows = list(c.execute("""select composerId, workspaceId, createdAt, lastUpdatedAt,
                                         isArchived, isSubagent, value
@@ -1308,21 +1335,49 @@ def cursor_chats():
         r = c.execute("select value from cursorDiskKV where key=?",
                       ("composerData:" + cid,)).fetchone()
         if not r: continue
-        try: data = json.loads(r[0]) or {}
+        try: heads = (json.loads(r[0]) or {}).get("fullConversationHeadersOnly") or []
         except Exception: continue
-        heads = data.get("fullConversationHeadersOnly") or []
         if not heads: continue
-        # most bubbles are tool calls with nothing to read; each header says
-        # whether its bubble has text, so how much was said can be counted
-        # without opening three thousand rows
-        said = sum(1 for h in heads if (h.get("grouping") or {}).get("hasText")) or len(heads)
+        said = sum(1 for h in heads if (h.get("grouping") or {}).get("hasText"))
         try: name = (json.loads(val) or {}).get("name") or ""
         except Exception: name = ""
-        out.append({"id": cid, "title": name or "(unnamed)",
-                    "folder": ws.get(str(wid), ""), "created": created,
-                    "last": updated, "archived": bool(arch),
-                    "bubbles": len(heads), "said": said})
+        out.append(_cursor_chat_row(ws, (cid, wid, created, updated, arch, name,
+                                        len(heads), said)))
     return out
+
+def cursor_chats():
+    """Every Cursor conversation that has anything in it. Most headers are empty
+    shells left behind by windows that were opened and closed."""
+    db = cursor_db()
+    if not db: return []
+    ws = cursor_folders()
+    c = cursor_ro(db)
+    try:
+        rows = list(c.execute(_cursor_chat_sql()))
+    except Exception:
+        # json_each cannot skip a row it cannot read. One malformed composerData
+        # blob fails the whole grouped statement, so the list would come back
+        # empty instead of one chat short. The slow path is the only one that can
+        # drop just the bad chat. Asking json_valid first would cost a second
+        # pass over all 181 MB of blob on every load, so the cost is paid on the
+        # failure rather than on every load that has nothing wrong with it.
+        return _cursor_chats_slow(c, ws)
+    return [_cursor_chat_row(ws, r) for r in rows]
+
+def cursor_chat(cid):
+    """One conversation by id, without building the whole list to find it. The
+    primary key answers this in well under a millisecond."""
+    db = cursor_db()
+    if not db: return None
+    try:
+        row = cursor_ro(db).execute(
+            _cursor_chat_sql("and h.composerId=?"), (cid,)).fetchone()
+    except Exception:
+        # no fallback wanted here: the predicate leaves json_each one blob to
+        # walk, so the only blob that can fail this is the one being asked for,
+        # and the old code skipped that chat too
+        return None
+    return _cursor_chat_row(cursor_folders(), row) if row else None
 
 def _tool_line(t):
     """One tool call, said in a line. Cursor keeps the arguments as raw JSON;
@@ -1345,21 +1400,52 @@ def _tool_line(t):
     hint = " ".join(str(hint).split())            # a tool call is one line
     return f"-> {name}({hint[:120]})" if hint else f"-> {name}()"
 
-def cursor_messages(cid):
-    """One Cursor conversation as plain turns, oldest first.
+def cursor_turns(cid, tail=0):
+    """One Cursor conversation as plain turns, oldest first, and how many turns
+    it has in all.
 
     Most bubbles carry no prose at all - in a 4,563 bubble chat only a couple of
     hundred do, and three thousand are tool calls. Dropping those would throw
     away what the conversation actually did, so a run of them is folded into the
     message before it as one line each. They are written as text, not as
     tool_use blocks: a tool_use has to be answered by a tool_result or the
-    conversation is malformed, and there is nothing here to answer it with."""
+    conversation is malformed, and there is nothing here to answer it with.
+
+    tail is how many turns with prose are wanted, counted from the newest, or 0
+    for every one of them. The headers are in order, so a tail reads them
+    backwards and stops as soon as it has enough: the worst conversation on this
+    machine is 6,721 bubbles and 441 MB of blob for 2,581 turns, and the newest
+    300 of those sit in its last 787 bubbles and 95 MB. Only the display path
+    passes a tail. Converting a conversation reads all of it, see cursor_messages."""
     db = cursor_db()
-    if not db: return []
+    if not db: return [], 0
     c = cursor_ro(db)
     r = c.execute("select value from cursorDiskKV where key=?", ("composerData:" + cid,)).fetchone()
-    if not r: return []
+    if not r: return [], 0
     heads = (json.loads(r[0]) or {}).get("fullConversationHeadersOnly") or []
+    # the count the chat list already shows, taken from the headers alone, so it
+    # is still the whole conversation when the read below stops early
+    said = sum(1 for h in heads if (h.get("grouping") or {}).get("hasText"))
+    total = said or len(heads)
+
+    # sqlite3 keeps its own statement cache, so the one SQL string below is
+    # prepared once however many bubbles this reads
+    read, got = [], 0
+    for h in reversed(heads):
+        b = c.execute("select value from cursorDiskKV where key=?",
+                      ("bubbleId:%s:%s" % (cid, h.get("bubbleId")),)).fetchone()
+        if not b: continue
+        try: d = json.loads(b[0]) or {}
+        except Exception: continue
+        text = (d.get("text") or "").strip()
+        tool = _tool_line(d["toolFormerData"]) if not text and d.get("toolFormerData") else ""
+        if not text and not tool: continue
+        read.append((h.get("createdAt") or d.get("createdAt") or "", d.get("type"), text, tool))
+        if text:
+            got += 1
+            if tail and got >= tail: break
+    read.reverse()                     # a tool run belongs to the turn after it
+
     out, pending = [], []
 
     def flush(ts):
@@ -1367,23 +1453,22 @@ def cursor_messages(cid):
         out.append({"role": "assistant", "text": "\n".join(pending), "t": ts})
         pending.clear()
 
-    for h in heads:
-        b = c.execute("select value from cursorDiskKV where key=?",
-                      ("bubbleId:%s:%s" % (cid, h.get("bubbleId")),)).fetchone()
-        if not b: continue
-        try: d = json.loads(b[0]) or {}
-        except Exception: continue
-        ts = h.get("createdAt") or d.get("createdAt") or ""
-        text = (d.get("text") or "").strip()
-        role = "user" if d.get("type") == 1 else "assistant"
-        if text:
-            if role == "user": flush(ts)
-            elif pending: text = "\n".join(pending) + "\n\n" + text; pending.clear()
-            out.append({"role": role, "text": text, "t": ts})
-        elif d.get("toolFormerData"):
-            pending.append(_tool_line(d["toolFormerData"]))
+    for ts, typ, text, tool in read:
+        if not text:
+            pending.append(tool); continue
+        role = "user" if typ == 1 else "assistant"
+        if role == "user": flush(ts)
+        elif pending: text = "\n".join(pending) + "\n\n" + text; pending.clear()
+        out.append({"role": role, "text": text, "t": ts})
     flush(out[-1]["t"] if out else "")
-    return out
+    return out, total
+
+def cursor_messages(cid):
+    """Every turn in a conversation, for the paths that convert one rather than
+    show it. No cap reaches here on purpose: a converted chat that quietly lost
+    messages cannot be told from a complete one, and the copy is what the user
+    keeps."""
+    return cursor_turns(cid)[0]
 
 def write_transcript(path, msgs, cwd, sid):
     """A Claude Code transcript, written from turns that came from somewhere
@@ -1414,9 +1499,10 @@ def op_cursor_import(cid, acct, org, force=False):
     conversation, so converting the same chat twice rewrites the one file
     instead of leaving a second copy."""
     guard(force)
-    hit = [x for x in cursor_chats() if x["id"] == cid or x["id"].startswith(cid)]
-    if not hit: raise RuntimeError(f"no Cursor chat {cid!r}")
-    chat = hit[0]
+    # an id in full is a primary key lookup; a prefix still has to be searched
+    chat = cursor_chat(cid) or next(
+        (x for x in cursor_chats() if x["id"].startswith(cid)), None)
+    if not chat: raise RuntimeError(f"no Cursor chat {cid!r}")
     if not chat["folder"]:
         raise RuntimeError("that Cursor chat has no folder on this machine")
     if not os.path.isdir(scope_dir(acct, org)):
@@ -1463,18 +1549,29 @@ def cursor_scope():
                 "isCurrent": False, "label": "", "profile": None}
 
 def cursor_detail(cid):
-    """A Cursor chat read straight out of Cursor, before anything is written."""
-    hit = [x for x in cursor_chats() if x["id"] == cid]
-    if not hit: raise RuntimeError("no such Cursor chat")
-    chat = hit[0]
-    msgs = [{"role": m["role"], "t": (m["t"] or "")[:16], "text": m["text"], "tools": []}
-            for m in cursor_messages(cid)]
+    """A Cursor chat read straight out of Cursor, before anything is written.
+    Only the newest turns come back: the whole of the worst conversation here is
+    2.59 MB and 46,296 nodes, which locked the window on every click. The window
+    asks for the rest with cursor_full."""
+    return cursor_view(cid, 300)
+
+def cursor_full(cid):
+    """The same chat with nothing held back, for the window's "load all"."""
+    return cursor_view(cid, 0)
+
+def cursor_view(cid, tail):
+    chat = cursor_chat(cid)
+    if not chat: raise RuntimeError("no such Cursor chat")
+    turns, total = cursor_turns(cid, tail)
+    msgs = [{"role": m["role"], "t": (m["t"] or "")[:16], "text": (m["text"] or "")[:24000],
+             "tools": []} for m in turns]
     rec = {"sessionId": None, "cliSessionId": cid, "title": chat["title"],
            "cwd": chat["folder"], "model": "", "createdAt": chat["created"],
-           "lastActivityAt": chat["last"], "completedTurns": len(msgs),
+           "lastActivityAt": chat["last"], "completedTurns": total,
            "isArchived": chat["archived"], "source": "cursor", "sourceName": "Cursor"}
     return {"rec": rec, "files": [], "source": "cursor", "sourceName": "Cursor",
-            "bytes": sum(len(m["text"]) for m in msgs), "subs": 0, "msgs": msgs}
+            "bytes": sum(len(m["text"]) for m in msgs), "subs": 0, "msgs": msgs,
+            "total": total, "full": not tail}
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -1585,13 +1682,9 @@ def _bubble_skel(bid, typ, text, created):
         "tokenCount": {"inputTokens": 0, "outputTokens": 0},
     }
 
-def write_cursor_chat(db_path, rec, msgs, live=False):
+def write_cursor_chat(db_path, rec, msgs):
     """Insert or replace one converted conversation. Same Claude session always
-    lands on the same composerId, so a second export updates that one chat.
-
-    live says Cursor was left open on purpose. It changes nothing about the
-    write, which is careful either way; it only decides whether the caller is
-    told the window still has to be reloaded."""
+    lands on the same composerId, so a second export updates that one chat."""
     if not msgs:
         raise RuntimeError("nothing to convert - this chat's transcript was pruned")
     cid = _composer_id(rec)
@@ -1699,28 +1792,22 @@ def write_cursor_chat(db_path, rec, msgs, live=False):
             # workspaceIdentifier matches that window, so a chat whose folder
             # matched no Cursor workspace is on disk and in no list. Reloading
             # will not change that, and saying it would be a lie.
-            "noWorkspace": not wid,
-            "needsReload": bool(live)}
+            "noWorkspace": not wid}
 
-def op_cursor_export(path, live=False):
+def op_cursor_export(path):
     """Convert one Claude chat into a Cursor conversation. The JSONL stays;
-    Cursor gets invented composer rows.
-
-    Quitting Cursor first is still the default, and still the only way the chat
-    shows up straight away. live=True writes with Cursor open instead. That is
-    safe for the database and not free for Cursor - CURSOR_LIVE_NOTE says what
-    the trade is."""
+    Cursor gets invented composer rows. Cursor has to be quit first, so the
+    chat is there the next time it starts."""
     if str(path).startswith("cursor:"):
         raise RuntimeError("that chat is already in Cursor")
-    running = cursor_running()
-    if not live: cursor_guard()
+    cursor_guard()
     db = cursor_db()
     if not db: raise RuntimeError("no Cursor storage here")
     rec = read_rec(path)
     if not rec: raise RuntimeError("chat unreadable")
-    return write_cursor_chat(db, rec, _export_turns(rec), live=live and running)
+    return write_cursor_chat(db, rec, _export_turns(rec))
 
-def cmd_cursor_export(query, live=False):
+def cmd_cursor_export(query):
     st = scan()
     hits = []
     for s in st["scopes"]:
@@ -1739,11 +1826,10 @@ def cmd_cursor_export(query, live=False):
             print("   %-40s [%s]" % ((h.get("title") or "")[:40], (h.get("sid") or "")[:8]))
         return
     chat = next(iter(seen.values()))
-    r = op_cursor_export(chat["path"], live=live)
+    r = op_cursor_export(chat["path"])
     print(f"{r['title']!r}")
     print(f"  {r['messages']} turns -> Cursor  [{r['id'][:8]}]")
     print(f"  folder     : {r['folder'] or '(none matched a Cursor workspace)'}")
-    if r.get("needsReload"): print(f"  {CURSOR_LIVE_NOTE}")
     if r.get("noWorkspace"):
         print("  note       : no Cursor workspace matched that folder, so the chat")
         print("               is in the database but not in any window's list")
@@ -1822,9 +1908,8 @@ if __name__ == "__main__":
         if len(sys.argv) < 4: print("usage: ferry-cli.py cursor-import <text|id> <account>")
         else: cmd_cursor_import(sys.argv[2], sys.argv[3])
     elif a=="cursor-export":
-        if len(sys.argv) < 3:
-            print("usage: ferry-cli.py cursor-export <text|id> [--live]")
-        else: cmd_cursor_export(sys.argv[2], live="--live" in sys.argv[3:])
+        if len(sys.argv) < 3: print("usage: ferry-cli.py cursor-export <text|id>")
+        else: cmd_cursor_export(sys.argv[2])
     elif a=="ui":
         if "--demo" in sys.argv:
             print(f"demo data -> {demo_setup()}")

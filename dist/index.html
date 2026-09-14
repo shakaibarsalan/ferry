@@ -43,6 +43,7 @@ input,select{font:inherit;color:inherit}
 .btn.p:hover{filter:brightness(1.07)}
 .btn.d:hover{color:#c0392b;border-color:#c0392b}
 .btn.sm{height:24px;padding:0 10px;font-size:11px;border-radius:7px}
+.btn:disabled{opacity:.55;cursor:default}
 /* Title-bar marks: Claude and Cursor always sit here. A corner dot is the
    running state (green open, red quit). Writes stay blocked while open.
    Not the account-row .dotc, which is signed-in.
@@ -134,6 +135,10 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='6'><path d='M0 0h9L4.5 6z' fill='%236b6a67'/></svg>")}
 .tools select:hover{border-color:var(--faint)}
 #body{padding:22px 28px 80px;max-width:760px}
+/* the older turns a big Cursor chat has not loaded, and the way to ask for them */
+.more{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 26px;padding:11px 14px;
+ border:1px solid var(--line);border-radius:10px;background:var(--panel);font-size:12px;color:var(--faint)}
+.more p{flex:1;min-width:220px;margin:0;line-height:1.55}
 
 .turn{margin:0 0 26px}
 .who2{font-size:10px;text-transform:uppercase;letter-spacing:.09em;font-weight:700;
@@ -289,7 +294,7 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
 </style></head><body>
 
 <div id=bar>
-  <span class=brand><span class=nm>Ferry</span><span class=ver id=appver>1.5.0</span></span>
+  <span class=brand><span class=nm>Ferry</span><span class=ver id=appver>1.5.3</span></span>
   <span style="flex:1"></span>
   <span style="flex:1"></span><span id=lock role=group aria-label="App write locks"></span>
   <button class=btn onclick=vault() title="Copy every chat and transcript into ~/.ferry. Protects against Claude deleting a chat and against the 30-day transcript cleanup.">Back up</button>
@@ -314,7 +319,7 @@ const fmt=b=>b>=1048576?(b/1048576).toFixed(1)+" MB":Math.max(1,Math.round(b/102
 const day=m=>m?new Date(m).toISOString().slice(0,10):"-";
 const hue=s=>{let h=0;for(const c of s)h=(h*31+c.charCodeAt(0))%360;return h;};
 const APP_NAME="Ferry";                       // one place to change the product name
-const FALLBACK_VER="1.5.0";                   // used until scan() returns version
+const FALLBACK_VER="1.5.3";                   // used until scan() returns version
 const appVer=()=>(S&&S.version)||FALLBACK_VER;
 function paintVer(){const v=appVer();const el=$("#appver");if(el)el.textContent=v;document.title=APP_NAME+" "+v;}
 const WIN=/Windows/.test(navigator.userAgent);   // genuinely platform-specific bits only
@@ -322,10 +327,17 @@ const RICH=true;                                 // the loading / confirm / masc
 const MAC=/Mac/.test(navigator.platform||navigator.userAgent);
 const MODK=e=>MAC?e.metaKey:e.ctrlKey;           // Cmd on a Mac, Ctrl elsewhere
 const MARK=`<svg class=mk viewBox="0 0 100 100" aria-hidden=true>\n <defs><mask id="gap">\n <rect width="100" height="100" fill="#fff"/>\n <rect x="57.4" y="38.9" width="18.6" height="11.8" fill="#000"/>\n </mask></defs>\n <path mask="url(#gap)" fill="currentColor" fill-rule="evenodd"\n d="M33 26.9h24.6a11.2 11.2 0 0 1 11.2 11.2v14.8a11.2 11.2 0 0 1-11.2 11.2H33\n A11.2 11.2 0 0 1 21.8 52.9V38.1A11.2 11.2 0 0 1 33 26.9Z\n M33.9 32.9h22.8a6 6 0 0 1 6 6v13.2a6 6 0 0 1-6 6H33.9a6 6 0 0 1-6-6V38.9a6 6 0 0 1 6-6Z"/>\n <path mask="url(#gap)" fill="currentColor" d="M31.2 63.4h14.1l-15 13.4Z"/>\n <rect x="42.5" y="42" width="33.5" height="5.6" rx="2.8" fill="#d97757"/>\n <path fill="#d97757" d="M81.2 44.8 70.8 37.9v13.8Z"/>\n </svg>`;
-let S=null,scopeKey=null,chatPath=null,q="",dragged=null;
+let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0;
 
 function toast(m,err){const t=$("#toast");t.textContent=m;t.className="on"+(err?" err":"");
  clearTimeout(t._x);t._x=setTimeout(()=>t.className="",err?5200:2400);}
+
+// Wait for what was just set to reach the screen. Two frames, because a rAF
+// callback still runs before its own frame is painted, and a timeout beside
+// them, because rAF is throttled to nothing while the window is hidden or on
+// another desktop - and the read has to run either way.
+const painted=()=>new Promise(r=>{const t=setTimeout(r,60);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{clearTimeout(t);r();}));});
 
 /* ---------- mascot ----------
    The Ferry logo come alive: one head per account, joined by the bar, and a
@@ -407,7 +419,7 @@ async function busy(msg,fn,o={}){
    once, so a refusal never looks like a success. */
 const LOOK=[{look:1},{look:1},{look:1}],TRIP=[],CHEER=Array(7).fill(HAPPY);
 for(let i=0;i<=11;i++)TRIP.push({look:1,cargo:i/11});
-async function transfer(path,t,mv,live){
+async function transfer(path,t,mv){
   if(busyOn)return;busyOn=true;
   const imp=(mv==="import"),toCur=(mv==="toCursor");
   const a=$("#ask"),ok=toCur?"Converted into Cursor":(imp?"Added to ":mv?"Moved to ":"Copied to ")+short(t);
@@ -423,7 +435,7 @@ async function transfer(path,t,mv,live){
     const m=a.querySelector(".route .mascot");m.classList.add("own");   // the idle loop lets go of it
     const play=fs=>new Promise(z=>{let i=0;(function f(){
       if(i>=fs.length||err)return z();m.innerHTML=drawMascot(fs[i++]);setTimeout(f,110);})();});
-    const work=(toCur?iv("export_to_cursor",{path:path,live:!!live})
+    const work=(toCur?iv("export_to_cursor",{path:path})
                    :imp?iv("import_session",{path:path,acct:t.acct,org:t.org})
                    :iv("copy_chat",{path:path,acct:t.acct,org:t.org,mv:mv}))
       .then(r=>{res=r;},e=>{err=String(e);}).finally(()=>{landed=true;});
@@ -431,9 +443,8 @@ async function transfer(path,t,mv,live){
     else{await play(LOOK);do{await play(TRIP);}while(!landed&&!err);}
     await work;
     if(err)return toast(err,true);
-    const reload=!!(res&&res.needsReload);                           // written, but not on screen yet
-    $("#askh").textContent=reload?"Written. Reload the Cursor window"
-      :toCur?"Converted into Cursor":imp?"Chat added":mv?"Chat moved":"Chat copied";   // the title says it; the status
+    $("#askh").textContent=
+      toCur?"Converted into Cursor":imp?"Chat added":mv?"Chat moved":"Chat copied";   // the title says it; the status
     $("#astat").style.visibility="hidden";                           // line steps aside, keeping its space
     $("#tfrom").classList.remove("hl");$("#tto").classList.add("hl");   // the ring follows the chat
     if(mv===true)$("#tfrom").classList.add("out");
@@ -447,7 +458,7 @@ async function transfer(path,t,mv,live){
         else drawRead(null);})()]);
     toast(res&&res.noWorkspace
       ? "Written, but no Cursor workspace matched that folder, so it is in no chat list"
-      : reload?(S.cursorLiveNote||ok):ok);
+      : ok);
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
@@ -586,7 +597,7 @@ function sendGroup(){
     '<button class=pick id=pick data-list=dests onclick="pickMenu(event)" title="'+esc(whoTip(t))+
       '" aria-haspopup=listbox aria-expanded=false>'+avatar(t)+'<span>'+to+'</span>'+CHEVRON+'</button>'+
     '<span class=sep></span>'+
-    '<button class="btn p" onclick=btnSend("toCursor") title="Convert this Claude chat into a Cursor conversation. The Claude chat stays. Quitting Cursor first is cleanest; with Cursor open the chat appears after a window reload.">Convert</button></span>';
+    '<button class="btn p" onclick=btnSend("toCursor") title="Convert this Claude chat into a Cursor conversation. The Claude chat stays. Quit Cursor first: Ferry will not write while it is open.">Convert</button></span>';
   return '<span class=sendg><span class=cap>Send to</span>'+
     '<button class=pick id=pick data-list=dests onclick="pickMenu(event)" title="'+esc(whoTip(t))+
       '" aria-haspopup=listbox aria-expanded=false>'+avatar(t)+'<span>'+to+'</span>'+CHEVRON+'</button>'+
@@ -684,22 +695,18 @@ function ask(p,t,mv){
         ', and you can restore it from the deleted list.</p>'
      :mv?'<p>It moves to '+to+' and leaves '+from+', where you can restore it from the deleted list.</p>'
      :'<p>It is added to '+to+' and stays in '+from+'.</p>')+
-    (toCur&&S.cursorRunning?'<p class=warn>Cursor is open. Quitting it first is the clean way: '+
-        'the chat is simply there the next time Cursor starts. Converting with Cursor open writes '+
-        'the chat now, but Cursor keeps showing the list it read at startup, so it appears only '+
-        'after you run Developer: Reload Window.</p>':'')+
+    (toCur&&S.cursorRunning?'<p class=warn>Cursor is open, so Ferry can\'t write yet. Quit Cursor, then confirm.</p>':'')+
     (!toCur&&S.appRunning?'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>':'')+
     '<div class=askb>'+btn("an","Cancel")+
-      (toCur?btn("ago",S.cursorRunning?"Convert with Cursor open":"Convert",1)
+      (toCur?btn("ago","Convert",1)
        :imp?btn("ago","Add to "+to,1)
        :mv===null?btn("am","Move")+btn("ac","Copy",1):btn("ago",mv?"Move":"Copy",1))+'</div></div>';
   a.className="on";wake();
   $("#tfrom").classList.add("hl");                             // the chat starts here
   $("#an").onclick=closeAsk;
   a.onclick=e=>{if(e.target===a)closeAsk();};                  // a click outside the card cancels
-  const live=!!(toCur&&S.cursorRunning);                       // the button already said so
   for(const [id,m] of [["am",true],["ac",false],["ago",mv]])   // the card stays: transfer() runs in it
-    if($("#"+id))$("#"+id).onclick=()=>send(p,t,m,live);
+    if($("#"+id))$("#"+id).onclick=()=>send(p,t,m);
   a.querySelector(".btn.p").focus();                           // Enter confirms, Esc cancels
 }
 
@@ -918,11 +925,13 @@ async function openChat(p){chatPath=p;drawList();
   catch(e){clearTimeout(t);toast(String(e),true);}}
 
 function drawRead(d){
+  bodyRun++;                          // stops a chunked fill still running for the last chat
   if(!d){$("#read").innerHTML='<div class=empty>Select a conversation.<br>'+
     'Drag one onto an account in the sidebar to copy or move it.</div>';return;}
   // a chat no account owns yet: nothing to rename, nothing to delete it from,
   // and the row below offers to add it to an account rather than to send it on
   const r=d.rec,src=isSrc(scope()),others=accts().filter(x=>key(x)!==scopeKey);curD=d;
+  const held=(d.total||0)-d.msgs.length;      // Cursor only: what a big chat is still holding
   const meta=esc((r.model||"").replace("claude-",""))+' · '+(r.completedTurns||0)+
        ' turns · '+day(r.createdAt)+' → '+day(r.lastActivityAt)+' · '+d.files.length+
        ' transcripts · '+fmt(d.bytes)+(d.subs?' · '+d.subs+' subagent':'')+
@@ -956,15 +965,49 @@ function drawRead(d){
         :others.length&&src?'':'')+
        '<span style="flex:1"></span>'+fileops+'</div>')+
      '</div>'+
-   '<div id=body>'+(d.msgs.length?d.msgs.map(m=>
+   '<div id=body>'+
+     (!d.full&&held>0?'<div class=more><p>Showing the newest '+d.msgs.length+' of '+d.total+
+        ' messages. The '+held+' older ones are not loaded yet.</p>'+
+        '<button class="btn sm" id=more onclick=loadAll()>Load all</button></div>':'')+
+     (d.msgs.length?''
+    :'<div class=empty style="color:var(--warn)">Transcript is gone - pruned by retention.<br>Archiving prevents this.</div>')+
+   '</div>';
+  fillBody(d.msgs);
+}
+
+const turn=m=>
      '<div class="turn '+m.role+'">'+
        '<div class=who2>'+(m.role==="user"?"You":"Claude")+' · '+m.t.replace("T"," ")+'</div>'+
        '<div class=bub>'+(m.text?md(m.text):"")+
          (m.tools||[]).map(t=>{const i=t.indexOf(" - ");
            return '<span class=tchip><b>'+esc(i<0?t:t.slice(0,i))+'</b>'+(i<0?"":esc(t.slice(i+3)))+'</span>';}).join("")+
-       '</div></div>').join("")
-    :'<div class=empty style="color:var(--warn)">Transcript is gone - pruned by retention.<br>Archiving prevents this.</div>')+
-   '</div>';
+       '</div></div>';
+
+// A chunk a frame, rather than one innerHTML of the lot. The biggest Cursor
+// conversation here is 46,296 nodes and half a second in which nothing else
+// runs at all, and a click that lands inside it is simply lost. 100 turns is
+// about 17 ms of work, so the thread comes back up for air between chunks.
+const CHUNK=100;
+function fillBody(msgs){
+  const run=bodyRun;let i=0;
+  const step=()=>{
+    const b=$("#body");
+    if(!b||run!==bodyRun)return;                 // a later chat took the pane
+    b.insertAdjacentHTML("beforeend",msgs.slice(i,i+CHUNK).map(turn).join(""));
+    i+=CHUNK;
+    if(i<msgs.length)requestAnimationFrame(step);
+  };
+  if(msgs.length)step();
+}
+
+// The turns chat_detail held back. The read is synchronous, so the button has
+// to say what it is doing and be painted before the invoke, not after it.
+async function loadAll(){
+  const p=chatPath,b=$("#more");if(!p)return;
+  if(b){b.disabled=true;b.textContent="Loading…";}
+  await painted();
+  try{const d=await iv("chat_full",{path:p});if(chatPath===p)drawRead(d);}
+  catch(e){if(b){b.disabled=false;b.textContent="Load all";}toast(String(e),true);}
 }
 
 async function op(cmd,args,ok,msg,o){
@@ -988,8 +1031,8 @@ const doDelete=()=>op("delete_chat",{path:chatPath},"Deleted");
 function btnSend(mv){const t=S.scopes.find(x=>key(x)===(RICH?tgtKey:$("#tgt").value));
   if(mv==="toCursor"||isCur(t))return RICH?ask(chatPath,t,"toCursor"):send(chatPath,t,"toCursor");
   RICH?ask(chatPath,t,mv):send(chatPath,t,mv);}
-function send(path,t,mv,live){if(RICH)return transfer(path,t,mv,live);
-  if(mv==="toCursor")return op("export_to_cursor",{path:path,live:!!live},"Converted into Cursor");
+function send(path,t,mv){if(RICH)return transfer(path,t,mv);
+  if(mv==="toCursor")return op("export_to_cursor",{path:path},"Converted into Cursor");
   op("copy_chat",{path:path,acct:t.acct,org:t.org,mv:mv},
   (mv?"Moved to ":"Copied to ")+label(t));}
 const undel=id=>{const s=scope();op("undelete_chat",{acct:s.acct,org:s.org,id:id},"Restored","Restoring…");};

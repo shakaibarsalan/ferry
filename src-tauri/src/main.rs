@@ -707,11 +707,91 @@ fn cursor_folders() -> std::collections::BTreeMap<String, String> {
     out
 }
 
+/// The one query behind both the conversation list and a single conversation,
+/// so a chat opened on its own is the chat that was in the list. narrow is the
+/// extra predicate that picks one row.
+///
+/// The counting happens in SQLite. composerData keeps the only copy of the
+/// bubble list and runs to 181 MB across these conversations, so carrying each
+/// blob over here to count it froze the window for a second on every load;
+/// json_each walks the same array in C and gives back two integers. The two
+/// joins are the emptiness test as well, because a conversation with no bubbles
+/// contributes no rows to group and falls out on its own.
+///
+/// The subagent filter is in SQL for the same reason: 3,509 of the 3,825 header
+/// rows are a subagent's own side conversation, and reading their 5.9 MB of
+/// value text only to drop it here was 5.9 MB read for nothing.
+fn chat_sql(narrow: &str) -> String {
+    // Most bubbles are tool calls with nothing to read. The header of each says
+    // whether it has text, so how much was actually said is counted without
+    // opening three thousand rows.
+    format!("select h.composerId, h.workspaceId, h.createdAt, h.lastUpdatedAt, \
+                    h.isArchived, json_extract(h.value,'$.name'), count(*), \
+                    sum(json_extract(e.value,'$.grouping.hasText')=1) \
+               from composerHeaders h \
+               join cursorDiskKV d on d.key='composerData:'||h.composerId \
+               join json_each(d.value,'$.fullConversationHeadersOnly') e \
+              where coalesce(h.isSubagent,0)=0 {} \
+              group by h.composerId order by h.lastUpdatedAt desc", narrow)
+}
+
+/// One conversation row, however it was found.
+fn chat_row(ws: &std::collections::BTreeMap<String, String>, r: &rusqlite::Row)
+    -> rusqlite::Result<Value>
+{
+    let wid = cell(r, 1);
+    let bubbles = r.get::<_, Option<i64>>(6).unwrap_or(None).unwrap_or(0);
+    let said = r.get::<_, Option<i64>>(7).unwrap_or(None).unwrap_or(0);
+    Ok(json!({
+        "id": cell(r, 0),
+        "title": r.get::<_, Option<String>>(5).unwrap_or(None)
+            .filter(|s| !s.is_empty()).unwrap_or_else(|| "(unnamed)".into()),
+        "folder": ws.get(&wid).cloned().unwrap_or_default(),
+        "created": r.get::<_, Option<i64>>(2).unwrap_or(None).unwrap_or(0),
+        "last": r.get::<_, Option<i64>>(3).unwrap_or(None).unwrap_or(0),
+        "bubbles": if said > 0 { said } else { bubbles },
+        "archived": r.get::<_, Option<i64>>(4).unwrap_or(None).unwrap_or(0) != 0
+    }))
+}
+
 /// Every Cursor conversation that has anything in it. Most headers are empty
 /// shells left behind by windows that were opened and closed.
 pub fn cursor_chats() -> Vec<Value> {
     let Some(c) = cursor_open() else { return vec![] };
-    let ws = cursor_folders();
+    chats_from(&c, &cursor_folders())
+}
+
+/// Grouped first, one conversation at a time only if that died.
+///
+/// json_each cannot skip a row it cannot read. One malformed composerData blob
+/// fails the whole grouped statement, so the list would come back empty instead
+/// of one chat short. The slow path is the only one that can drop just the bad
+/// chat. Asking json_valid first would cost a second pass over all 181 MB of
+/// blob on every load, so the cost is paid on the failure rather than on every
+/// load that has nothing wrong with it.
+fn chats_from(c: &rusqlite::Connection,
+              ws: &std::collections::BTreeMap<String, String>) -> Vec<Value> {
+    match chats_grouped(c, ws) {
+        Ok(v) => v,
+        Err(_) => chats_slow(c, ws),
+    }
+}
+
+/// The one statement, with the error kept rather than dropped: a blob json_each
+/// choked on halfway through must not read as the end of the list.
+fn chats_grouped(c: &rusqlite::Connection,
+                 ws: &std::collections::BTreeMap<String, String>)
+    -> rusqlite::Result<Vec<Value>>
+{
+    let mut st = c.prepare(&chat_sql(""))?;
+    let rows = st.query_map([], |r| chat_row(ws, r))?;
+    rows.collect()
+}
+
+/// One conversation at a time, with the blob parsed here rather than in SQLite,
+/// so a conversation whose blob will not parse is the only thing lost.
+fn chats_slow(c: &rusqlite::Connection,
+              ws: &std::collections::BTreeMap<String, String>) -> Vec<Value> {
     let Ok(mut st) = c.prepare("select composerId, workspaceId, createdAt, lastUpdatedAt, \
                                 isArchived, isSubagent, value from composerHeaders \
                                 order by lastUpdatedAt desc") else { return vec![] };
@@ -728,13 +808,10 @@ pub fn cursor_chats() -> Vec<Value> {
     for row in rows.flatten() {
         let (cid, wid, created, last, arch, sub, val) = row;
         if sub != 0 { continue; }                       // a subagent's side conversation
-        let Some(data) = cursor_get(&c, &format!("composerData:{}", cid)) else { continue };
+        let Some(data) = cursor_get(c, &format!("composerData:{}", cid)) else { continue };
         let Some(d) = serde_json::from_str::<Value>(&data).ok() else { continue };
         let heads = d["fullConversationHeadersOnly"].as_array().cloned().unwrap_or_default();
         if heads.is_empty() { continue; }
-        // Most bubbles are tool calls with nothing to read. The header of each
-        // says whether it has text, so how much was actually said can be counted
-        // without opening three thousand rows.
         let n = heads.iter().filter(|h| h["grouping"]["hasText"].as_bool().unwrap_or(false)).count();
         let n = if n > 0 { n } else { heads.len() };
         let name = serde_json::from_str::<Value>(&val).ok()
@@ -746,6 +823,18 @@ pub fn cursor_chats() -> Vec<Value> {
         }));
     }
     out
+}
+
+/// One conversation by id, without building the whole list to find it. The
+/// primary key answers this in well under a millisecond.
+///
+/// No fallback wanted here: the predicate leaves json_each one blob to walk, so
+/// the only blob that can fail this is the one being asked for, and the old code
+/// skipped that chat too.
+pub fn cursor_chat(cid: &str) -> Option<Value> {
+    let c = cursor_open()?;
+    let ws = cursor_folders();
+    c.query_row(&chat_sql("and h.composerId=?1"), [cid], |r| chat_row(&ws, r)).ok()
 }
 
 fn cursor_get(c: &rusqlite::Connection, key: &str) -> Option<String> {
@@ -778,7 +867,8 @@ fn cursor_tool_line(t: &Value) -> String {
     if hint.is_empty() { format!("-> {}()", name) } else { format!("-> {}({})", name, hint) }
 }
 
-/// One Cursor conversation as plain turns, oldest first.
+/// One Cursor conversation as plain turns, oldest first, and how many turns it
+/// has in all.
 ///
 /// Most bubbles carry no prose at all - in a 4,563 bubble chat only a couple of
 /// hundred do, and three thousand are tool calls. Dropping those would throw
@@ -786,43 +876,78 @@ fn cursor_tool_line(t: &Value) -> String {
 /// message before it as one line each. They are written as text, not as
 /// tool_use blocks: a tool_use has to be answered by a tool_result, and there
 /// is nothing on this side to answer it with.
-fn cursor_messages(cid: &str) -> Vec<Value> {
-    let Some(c) = cursor_open() else { return vec![] };
-    let Some(data) = cursor_get(&c, &format!("composerData:{}", cid)) else { return vec![] };
-    let Ok(d) = serde_json::from_str::<Value>(&data) else { return vec![] };
+///
+/// tail is how many turns with prose are wanted, counted from the newest, or 0
+/// for every one of them. The headers are in order, so a tail reads them
+/// backwards and stops as soon as it has enough: the worst conversation on this
+/// machine is 6,721 bubbles and 441 MB of blob for 2,581 turns, and the newest
+/// 300 of those sit in its last 787 bubbles and 95 MB. Only the display path
+/// passes a tail. Converting a conversation reads all of it, see cursor_messages.
+fn cursor_turns(cid: &str, tail: usize) -> (Vec<Value>, usize) {
+    let Some(c) = cursor_open() else { return (vec![], 0) };
+    let Some(data) = cursor_get(&c, &format!("composerData:{}", cid)) else { return (vec![], 0) };
+    let Ok(d) = serde_json::from_str::<Value>(&data) else { return (vec![], 0) };
     let heads = d["fullConversationHeadersOnly"].as_array().cloned().unwrap_or_default();
+    // the count the chat list already shows, taken from the headers alone, so
+    // it is still the whole conversation when the read below stops early
+    let said = heads.iter().filter(|h| h["grouping"]["hasText"].as_bool().unwrap_or(false)).count();
+    let total = if said > 0 { said } else { heads.len() };
+
+    // One statement for thousands of lookups. Connection::query_row prepares a
+    // fresh one on every call, and this runs once a bubble.
+    let Ok(mut q) = c.prepare("select value from cursorDiskKV where key=?1") else { return (vec![], total) };
+
+    // stamp, Cursor's own bubble type, prose, tool call line
+    let mut read: Vec<(String, i64, String, String)> = vec![];
+    let mut got = 0usize;
+    for h in heads.iter().rev() {
+        let Some(bid) = h["bubbleId"].as_str() else { continue };
+        let Ok(raw) = q.query_row([format!("bubbleId:{}:{}", cid, bid)], |r| Ok(cell(r, 0))) else { continue };
+        let Ok(b) = serde_json::from_str::<Value>(&raw) else { continue };
+        let text = b["text"].as_str().unwrap_or("").trim().to_string();
+        let tool = if text.is_empty() && !b["toolFormerData"].is_null() {
+            cursor_tool_line(&b["toolFormerData"])
+        } else { String::new() };
+        if text.is_empty() && tool.is_empty() { continue; }
+        let prose = !text.is_empty();
+        read.push((h["createdAt"].as_str().or(b["createdAt"].as_str()).unwrap_or("").to_string(),
+                   b["type"].as_i64().unwrap_or(0), text, tool));
+        if prose {
+            got += 1;
+            if tail > 0 && got >= tail { break; }
+        }
+    }
+    read.reverse();                          // a tool run belongs to the turn after it
 
     let mut out: Vec<Value> = vec![];
     let mut pending: Vec<String> = vec![];
-    for h in &heads {
-        let Some(bid) = h["bubbleId"].as_str() else { continue };
-        let Some(raw) = cursor_get(&c, &format!("bubbleId:{}:{}", cid, bid)) else { continue };
-        let Ok(b) = serde_json::from_str::<Value>(&raw) else { continue };
-        let ts = h["createdAt"].as_str().or(b["createdAt"].as_str()).unwrap_or("").to_string();
-        let text = b["text"].as_str().unwrap_or("").trim().to_string();
-        let role = if b["type"].as_i64() == Some(1) { "user" } else { "assistant" };
-        if !text.is_empty() {
-            let mut text = text;
-            if role == "user" {
-                if !pending.is_empty() {
-                    out.push(json!({ "role": "assistant", "text": pending.join("\n"), "t": ts }));
-                    pending.clear();
-                }
-            } else if !pending.is_empty() {
-                text = format!("{}\n\n{}", pending.join("\n"), text);
+    for (ts, typ, text, tool) in read {
+        if text.is_empty() { pending.push(tool); continue; }
+        let role = if typ == 1 { "user" } else { "assistant" };
+        let mut text = text;
+        if role == "user" {
+            if !pending.is_empty() {
+                out.push(json!({ "role": "assistant", "text": pending.join("\n"), "t": ts }));
                 pending.clear();
             }
-            out.push(json!({ "role": role, "text": text, "t": ts }));
-        } else if !b["toolFormerData"].is_null() {
-            pending.push(cursor_tool_line(&b["toolFormerData"]));
+        } else if !pending.is_empty() {
+            text = format!("{}\n\n{}", pending.join("\n"), text);
+            pending.clear();
         }
+        out.push(json!({ "role": role, "text": text, "t": ts }));
     }
     if !pending.is_empty() {
         let ts = out.last().map(|m| m["t"].clone()).unwrap_or(Value::Null);
         out.push(json!({ "role": "assistant", "text": pending.join("\n"), "t": ts }));
     }
-    out
+    (out, total)
 }
+
+/// Every turn in a conversation, for the paths that convert one rather than
+/// show it. No cap reaches here on purpose: a converted chat that quietly lost
+/// messages cannot be told from a complete one, and the copy is what the user
+/// keeps.
+fn cursor_messages(cid: &str) -> Vec<Value> { cursor_turns(cid, 0).0 }
 
 /// Message uuids that keep a uuid's shape without a uuid crate: the
 /// conversation's own id with its tail replaced, so every line is distinct and
@@ -895,24 +1020,33 @@ pub fn cursor_scope() -> Option<Value> {
 }
 
 /// A Cursor chat read straight out of Cursor, before anything is written.
-pub fn cursor_detail(cid: &str) -> Result<Value, String> {
-    let chat = cursor_chats().into_iter()
-        .find(|c| c["id"].as_str() == Some(cid))
-        .ok_or("no such Cursor chat")?;
-    let msgs: Vec<Value> = cursor_messages(cid).iter().map(|m| json!({
+/// Only the newest turns come back: the whole of the worst conversation here is
+/// 2.59 MB and 46,296 nodes, which locked the window on every click. The window
+/// asks for the rest with cursor_full.
+pub fn cursor_detail(cid: &str) -> Result<Value, String> { cursor_view(cid, 300) }
+
+/// The same chat with nothing held back, for the window's "load all".
+pub fn cursor_full(cid: &str) -> Result<Value, String> { cursor_view(cid, 0) }
+
+fn cursor_view(cid: &str, tail: usize) -> Result<Value, String> {
+    let chat = cursor_chat(cid).ok_or("no such Cursor chat")?;
+    let (turns, total) = cursor_turns(cid, tail);
+    let msgs: Vec<Value> = turns.iter().map(|m| json!({
         "role": m["role"], "t": m["t"].as_str().unwrap_or("").chars().take(16).collect::<String>(),
-        "text": m["text"], "tools": []
+        "text": m["text"].as_str().unwrap_or("").chars().take(24000).collect::<String>(),
+        "tools": []
     })).collect();
     let bytes: u64 = msgs.iter().map(|m| m["text"].as_str().unwrap_or("").len() as u64).sum();
     let rec = json!({
         "sessionId": Value::Null, "cliSessionId": cid,
         "title": chat["title"], "cwd": chat["folder"], "model": "",
         "createdAt": chat["created"], "lastActivityAt": chat["last"],
-        "completedTurns": msgs.len(), "isArchived": chat["archived"],
+        "completedTurns": total, "isArchived": chat["archived"],
         "source": "cursor", "sourceName": "Cursor"
     });
     Ok(json!({ "rec": rec, "files": [], "source": "cursor", "sourceName": "Cursor",
-               "bytes": bytes, "subs": 0, "msgs": msgs }))
+               "bytes": bytes, "subs": 0, "msgs": msgs,
+               "total": total, "full": tail == 0 }))
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -1112,18 +1246,6 @@ fn flatten_turns(msgs: &[Value]) -> Vec<(String, String, String)> {
 /// that has to be patient, and the one that has to be quick.
 const CURSOR_BUSY_MS: i64 = 5000;
 
-/// What writing with Cursor open actually costs, in the words the user gets
-/// told. state.vscdb is WAL and the write is one short BEGIN IMMEDIATE
-/// transaction, so the file is not at risk. Two other things are, and neither
-/// is corruption: Cursor reads composerHeaders straight from SQL but only when
-/// its own sentinel key changes, and it has no way of noticing a change another
-/// process made - so the row is on disk immediately and on screen only after
-/// the window reloads. And while Ferry holds the write lock, Cursor's own
-/// writes fail outright instead of waiting.
-pub const CURSOR_LIVE_NOTE: &str =
-    "Cursor is open. The chat is written, and appears after you run \
-     Developer: Reload Window in Cursor.";
-
 /// The key range holding one conversation's bubbles. A prefix range, not LIKE:
 /// it is what Cursor itself uses to sweep a prefix, and on 1.8M rows it is an
 /// index seek rather than a scan.
@@ -1145,13 +1267,8 @@ fn busy_or(e: rusqlite::Error) -> String {
 
 /// Insert or replace one converted conversation. Same Claude session always
 /// lands on the same composerId, so a second export updates that one chat.
-///
-/// live says Cursor was left open on purpose. It changes nothing about the
-/// write, which is careful either way; it only decides whether the caller is
-/// told the window still has to be reloaded.
-pub fn cursor_write_claude(rec: &Value, msgs: &[Value], live: bool) -> Result<Value, String> {
-    let running = cursor_running();
-    if !live { cursor_guard()?; }
+pub fn cursor_write_claude(rec: &Value, msgs: &[Value]) -> Result<Value, String> {
+    cursor_guard()?;
     let db = cursor_db().ok_or("no Cursor storage here")?;
     let turns = flatten_turns(msgs);
     if turns.is_empty() {
@@ -1286,13 +1403,59 @@ pub fn cursor_write_claude(rec: &Value, msgs: &[Value], live: bool) -> Result<Va
                // workspaceIdentifier matches that window, so a chat whose
                // folder matched no Cursor workspace is on disk and in no list.
                // Reloading will not change that, and saying it would be a lie.
-               "noWorkspace": wid.is_empty(),
-               "needsReload": live && running }))
+               "noWorkspace": wid.is_empty() }))
+}
+
+/// The real state.vscdb is tens of gigabytes and opened read-only, so the one
+/// thing worth checking here cannot be checked against it: a blob that will not
+/// parse. A scratch file with the two table shapes the query needs stands in.
+#[cfg(test)]
+mod tests {
+    fn blob(n: usize) -> String {
+        let heads: Vec<String> = (0..n)
+            .map(|i| format!("{{\"bubbleId\":\"b{i}\",\"grouping\":{{\"hasText\":true}}}}"))
+            .collect();
+        format!("{{\"fullConversationHeadersOnly\":[{}]}}", heads.join(","))
+    }
+
+    /// Three conversations, the middle one's blob unreadable. Losing that one is
+    /// the whole point; losing the other two is the bug this guards.
+    #[test]
+    fn malformed_blob_costs_one_chat_not_the_list() {
+        let path = std::env::temp_dir().join("ferry-fallback-test.vscdb");
+        let _ = std::fs::remove_file(&path);
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "create table composerHeaders(composerId text primary key, workspaceId text, \
+                createdAt integer, lastUpdatedAt integer, isArchived integer, \
+                isSubagent integer, value text); \
+             create table cursorDiskKV(key text primary key, value text);").unwrap();
+        for (cid, last, sub, data) in [
+            ("aaa11111", 3000, 0, blob(4)),
+            ("bbb22222", 2000, 0, "{not json at all".to_string()),
+            ("ccc33333", 1000, 0, blob(6)),
+            ("ddd44444",  500, 1, blob(2)),      // a subagent's side conversation
+        ] {
+            c.execute("insert into composerHeaders values(?1,'ws1',1000,?2,0,?3,'{\"name\":\"n\"}')",
+                      rusqlite::params![cid, last, sub]).unwrap();
+            c.execute("insert into cursorDiskKV values('composerData:'||?1,?2)",
+                      rusqlite::params![cid, data]).unwrap();
+        }
+        let ws = std::collections::BTreeMap::new();
+
+        assert!(super::chats_grouped(&c, &ws).is_err(),
+                "json_each should fail the grouped statement on the bad blob");
+        let got = super::chats_from(&c, &ws);
+        assert_eq!(got.len(), 2, "expected the two readable chats, got {got:?}");
+        assert_eq!(got[0]["id"], "aaa11111");    // still newest first
+        assert_eq!(got[1]["id"], "ccc33333");
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 }   // mod cursor
 
-use cursor::{cursor_chats, cursor_detail, cursor_running, cursor_scope, cursor_write_claude, cursor_write_transcript, CURSOR_LIVE_NOTE};
+use cursor::{cursor_chat, cursor_detail, cursor_full, cursor_running, cursor_scope, cursor_write_claude, cursor_write_transcript};
 
 /// Every <account>/<org> scope under the sessions root, found by walking the
 /// directory rather than by pattern matching. Returns (account, org, dir).
@@ -1462,7 +1625,6 @@ fn scan() -> Value {
     if let Some(c) = cursor_scope() { list.push(c); }
     json!({ "scopes": list, "current": cur, "appRunning": app_running(),
             "cursorRunning": cursor_running(),
-            "cursorLiveNote": CURSOR_LIVE_NOTE,
             "vault": vault(), "exportDir": last_export_dir(),
             "version": env!("CARGO_PKG_VERSION"),
             "paths": { "sessions": sess(), "projects": proj(), "home": home() },
@@ -1569,6 +1731,17 @@ fn chat_detail(path: String) -> Result<Value, String> {
     let bytes: u64 = tr.iter().map(|t| t["size"].as_u64().unwrap_or(0)).sum();
     let subs: u64 = tr.iter().map(|t| t["subagents"].as_u64().unwrap_or(0)).sum();
     Ok(json!({ "rec": rec, "files": tr, "bytes": bytes, "subs": subs, "msgs": msgs }))
+}
+
+/// The rest of a conversation chat_detail held back, asked for by the window.
+#[cfg_attr(target_os = "windows", tauri::command(async))]
+#[cfg_attr(not(target_os = "windows"), tauri::command)]
+fn chat_full(path: String) -> Result<Value, String> {
+    match path.strip_prefix("cursor:") {
+        Some(cid) => cursor_full(cid),
+        // a Claude chat arrives whole already, so there is nothing else to fetch
+        None => chat_detail(path),
+    }
 }
 
 fn slug(s: &str) -> String {
@@ -1811,8 +1984,7 @@ fn import_session(path: String, acct: String, org: String) -> Result<Value, Stri
     let path = match path.strip_prefix("cursor:") {
         None => path,
         Some(cid) => {
-            let chat = cursor_chats().into_iter()
-                .find(|c| c["id"].as_str() == Some(cid)).ok_or("no such Cursor chat")?;
+            let chat = cursor_chat(cid).ok_or("no such Cursor chat")?;
             let p = cursor_write_transcript(&chat)?;
             let out = import_session_at(&p, &acct, &org)?;
             // Cursor already named the conversation; keep its name over the
@@ -1834,17 +2006,16 @@ fn import_session(path: String, acct: String, org: String) -> Result<Value, Stri
 }
 
 /// Convert a Claude chat into a Cursor conversation. The JSONL stays; Cursor
-/// gets invented composer rows. Refused while Cursor is running unless the
-/// caller asks for live, which writes with Cursor open and says so.
+/// gets invented composer rows. Refused while Cursor is running.
 #[cfg_attr(target_os = "windows", tauri::command(async))]
 #[cfg_attr(not(target_os = "windows"), tauri::command)]
-fn export_to_cursor(path: String, live: Option<bool>) -> Result<Value, String> {
+fn export_to_cursor(path: String) -> Result<Value, String> {
     if path.starts_with("cursor:") {
         return Err("that chat is already in Cursor".into());
     }
     let (rec, tr) = chat_parts(&path)?;
     let msgs = collect_msgs(&tr, 100_000, 2_000_000);
-    cursor_write_claude(&rec, &msgs, live.unwrap_or(false))
+    cursor_write_claude(&rec, &msgs)
 }
 
 /// The import itself, once there is a transcript to import. Kept apart from the
@@ -2022,7 +2193,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            scan, chat_detail, export_chat, copy_chat, import_session, export_to_cursor,
+            scan, chat_detail, chat_full, export_chat, copy_chat, import_session, export_to_cursor,
             set_folder, rename_chat, delete_chat, undelete_chat, set_label, run_vault, set_zoom
         ])
         .run(tauri::generate_context!())
