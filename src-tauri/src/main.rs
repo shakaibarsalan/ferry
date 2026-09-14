@@ -1028,6 +1028,37 @@ fn cursor_msg_uuid(cid: &str, i: usize) -> String {
     s
 }
 
+/// Whether this transcript is one Ferry wrote from a Cursor conversation, which
+/// is the only kind a conversion may overwrite. It says so on every line; only
+/// the first is read, because the file being asked about can be 25 MB.
+fn ferry_wrote(path: &str) -> bool {
+    let Ok(f) = fs::File::open(path) else { return false };
+    let mut line = String::new();
+    if BufReader::new(f).read_line(&mut line).is_err() { return false; }
+    serde_json::from_str::<Value>(&line)
+        .map(|v| v["entrypoint"].as_str() == Some("cursor"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    /// A Claude Code session must never read as Ferry's own, or converting a
+    /// round-tripped chat back would overwrite the conversation it came from.
+    #[test]
+    fn only_ferrys_own_transcript_counts_as_ours() {
+        let dir = std::env::temp_dir();
+        let ours = dir.join("ferry-wrote-ours.jsonl");
+        let theirs = dir.join("ferry-wrote-theirs.jsonl");
+        std::fs::write(&ours, "{\"type\":\"user\",\"entrypoint\":\"cursor\"}\n").unwrap();
+        std::fs::write(&theirs, "{\"type\":\"user\",\"entrypoint\":\"claude-desktop\"}\n").unwrap();
+        assert!(super::ferry_wrote(&ours.to_string_lossy()));
+        assert!(!super::ferry_wrote(&theirs.to_string_lossy()), "a Claude session is not ours");
+        assert!(!super::ferry_wrote(&dir.join("ferry-wrote-absent.jsonl").to_string_lossy()));
+        let _ = std::fs::remove_file(&ours);
+        let _ = std::fs::remove_file(&theirs);
+    }
+}
+
 /// A Claude Code transcript, written from turns that came from somewhere else.
 /// The shape is the one Claude Code appends: one JSON object a line, each
 /// linked to the one before it. entrypoint says where it really came from, so
@@ -1042,6 +1073,22 @@ pub fn cursor_write_transcript(chat: &Value) -> Result<String, String> {
     let dir = project_dir(cwd);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = format!("{}/{}.jsonl", dir, cid);
+
+    // A Claude chat converted into Cursor keeps its session id as the composer
+    // id, so converting it back names the transcript after that same session -
+    // and that is the file the original chat already has, whenever the chat's
+    // folder is the Cursor workspace itself rather than something inside it. On
+    // the machine this was found on that was 8 of 14 chats, the largest 25 MB
+    // and 9,567 lines. The write below is a plain overwrite, so the chat would
+    // have come back as a few hundred flattened turns with the rest gone, and
+    // nothing would have said so.
+    if Path::new(&path).exists() && !ferry_wrote(&path) {
+        return Err(format!(
+            "that would overwrite a transcript Claude Code wrote, at {path}. \
+             Nothing was changed."));
+    }
+    snapshot(&path, "transcript");          // does nothing when there is no file yet
+
     let mut body = String::new();
     let mut prev = Value::Null;
     for (i, m) in msgs.iter().enumerate() {

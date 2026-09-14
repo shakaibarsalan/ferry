@@ -1538,6 +1538,16 @@ def write_transcript(path, msgs, cwd, sid):
             prev = u
     return path
 
+def _ferry_wrote(path):
+    """Whether this transcript is one Ferry wrote from a Cursor conversation,
+    which is the only kind a conversion may overwrite. It says so on every line;
+    only the first is read, because the file asked about can be 25 MB."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return (json.loads(fh.readline()) or {}).get("entrypoint") == "cursor"
+    except Exception:
+        return False
+
 def op_cursor_import(cid, acct, org):
     """Convert one Cursor conversation into a Claude chat.
 
@@ -1559,6 +1569,17 @@ def op_cursor_import(cid, acct, org):
     if not msgs: raise RuntimeError("that Cursor chat has nothing readable in it")
 
     dst = os.path.join(project_dir(chat["folder"]), chat["id"] + ".jsonl")
+    # A Claude chat converted into Cursor keeps its session id as the composer
+    # id, so converting it back names the transcript after that same session -
+    # and that is the file the original chat already has, whenever the chat's
+    # folder is the Cursor workspace itself rather than something inside it. On
+    # the machine this was found on that was 8 of 14 chats, the largest 25 MB
+    # and 9,567 lines, and write_transcript is a plain overwrite.
+    if os.path.exists(dst) and not _ferry_wrote(dst):
+        raise RuntimeError(
+            "that would overwrite a transcript Claude Code wrote, at %s. "
+            "Nothing was changed." % dst)
+    snapshot(dst, "transcript")          # does nothing when there is no file yet
     write_transcript(dst, msgs, chat["folder"], chat["id"])
     rec = op_import(dst, acct, org)
     # the record's title comes from the first prompt; Cursor already named it
