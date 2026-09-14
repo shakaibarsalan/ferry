@@ -29,6 +29,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 HOME  = (os.environ.get("USERPROFILE") or os.path.expanduser("~")) \
         if sys.platform == "win32" else os.path.expanduser("~")
 
+def claude_dirs_windows():
+    """Every folder a Windows Claude can keep its state in: a direct install's
+    %APPDATA%\\Claude, and the Store build's
+    %LOCALAPPDATA%\\Packages\\Claude_<publisher>\\LocalCache\\Roaming\\Claude."""
+    appdata = os.environ.get("APPDATA", os.path.join(HOME, "AppData", "Roaming"))
+    local   = os.environ.get("LOCALAPPDATA", os.path.join(HOME, "AppData", "Local"))
+    return [os.path.join(appdata, "Claude")] + sorted(glob.glob(
+        os.path.join(local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude")))
+
 def claude_dir_windows():
     """The Microsoft Store build of Claude runs in an MSIX container that silently
     redirects %APPDATA%\\Claude to
@@ -36,10 +45,7 @@ def claude_dir_windows():
     Only processes inside the package see the redirect, so a standalone Ferry
     finds %APPDATA%\\Claude empty. Look in both; if more than one has chats,
     take the one written to most recently."""
-    appdata = os.environ.get("APPDATA", os.path.join(HOME, "AppData", "Roaming"))
-    local   = os.environ.get("LOCALAPPDATA", os.path.join(HOME, "AppData", "Local"))
-    cands = [os.path.join(appdata, "Claude")] + sorted(glob.glob(
-        os.path.join(local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude")))
+    cands = claude_dirs_windows()
     live = [c for c in cands if os.path.isdir(os.path.join(c, "claude-code-sessions"))]
     if not live: return cands[0]
     def newest(c):
@@ -103,13 +109,34 @@ def ts(ms):
     try: return datetime.fromtimestamp(ms/1000).strftime("%Y-%m-%d %H:%M")
     except Exception: return "?"
 
+def _lock_held(path):
+    """Twin of lock_held in main.rs. Chromium holds <user data>\\lockfile with
+    delete access - that is how Windows deletes it on exit - and lets others
+    read, so a second open collides with it only if that open refuses to share
+    delete. Asking to share read and write only is what makes this a test at
+    all: share delete as well and the open succeeds while the app is plainly
+    running. The CRT's open() happens to ask for exactly this, but it is said
+    out loud here, because the app's std File::open shared delete and so read a
+    running Claude as quit."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE]
+    GENERIC_READ, SHARE_READ_WRITE, OPEN_EXISTING = 0x80000000, 0x3, 3
+    h = k32.CreateFileW(path, GENERIC_READ, SHARE_READ_WRITE, None, OPEN_EXISTING, 0, None)
+    if h in (wintypes.HANDLE(-1).value, None):
+        return ctypes.get_last_error() == 32           # ERROR_SHARING_VIOLATION
+    k32.CloseHandle(h)
+    return False
+
 def app_running():
     if sys.platform == "win32":
-        # Chromium holds <user data>\lockfile open, unshared, while the app runs
-        # and Windows deletes it on exit; a PowerShell process query took ~2 s
-        try: open(f"{CLAUDE}/lockfile", "rb").close(); return False
-        except PermissionError: return True
-        except OSError: return False
+        # A Store install and a direct install can sit side by side, and the one
+        # that is running need not be the one with the newest chats.
+        return any(_lock_held(os.path.join(d, "lockfile")) for d in claude_dirs_windows())
     try:
         # -a is not optional. pgrep hides itself and every one of its ancestors
         # unless it is passed, so a Ferry launched from the target app's own
@@ -1163,14 +1190,33 @@ def cursor_app_dir():
     """Parent of User/: .../Cursor, where code.lock lives."""
     return os.path.dirname(CURSOR.rstrip("\\/"))
 
+def _pid_alive(pid):
+    """Twin of pid_alive in main.rs. On Windows os.kill is not a probe: signal 0
+    is CTRL_C_EVENT there, so os.kill(pid, 0) sends a console control event to
+    that process group, and only happens to raise for a pid that has gone. The
+    app asks tasklist, so the CLI does too."""
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                                 capture_output=True, text=True,
+                                 creationflags=0x08000000).stdout   # CREATE_NO_WINDOW
+            return str(pid) in out
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
 def cursor_running():
     """True if the Cursor app is up. code.lock holds the main pid; pgrep is
     the fallback on a Mac whose lock file was left behind."""
     lock = os.path.join(cursor_app_dir(), "code.lock")
     try:
         pid = int(open(lock, encoding="utf-8").read().strip())
-        os.kill(pid, 0)
-        return True
+        if _pid_alive(pid):
+            return True
     except Exception:
         pass
     if sys.platform == "darwin":

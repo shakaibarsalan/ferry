@@ -15,10 +15,16 @@ jobs:
           rustc --version
           cargo --version
 
+      # The Rust tests run here and not only on the Mac: the lockfile guard is
+      # Windows-only code, and so is the test that holds a lockfile open the way
+      # Chromium does.
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       # `tauri build` compiles the same release binary as `cargo build --release`,
-      # then wraps it in an installer (settings: src-tauri/tauri.windows.conf.json).
-      - name: Build app and installer
-        run: npx --yes @tauri-apps/cli@2 build --bundles nsis
+      # then wraps it in installers (settings: src-tauri/tauri.windows.conf.json).
+      - name: Build app and installers
+        run: npx --yes @tauri-apps/cli@2 build --bundles nsis,msi
 
       - name: Stage
         shell: pwsh
@@ -26,10 +32,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist-win | Out-Null
           Copy-Item src-tauri/target/release/ferry.exe dist-win/Ferry.exe
           Copy-Item src-tauri/target/release/bundle/nsis/*-setup.exe dist-win/
+          Copy-Item src-tauri/target/release/bundle/msi/*.msi dist-win/
           Get-ChildItem dist-win | Select-Object Name,Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: Ferry-windows-x64
-          path: dist-win/*.exe
+          path: dist-win/*
           if-no-files-found: error
