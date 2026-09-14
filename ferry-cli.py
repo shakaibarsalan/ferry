@@ -508,14 +508,16 @@ def snapshot(path, tag):
     shutil.copy2(path, dest)
     return dest
 
-def guard(force=False):
-    if app_running() and not force:
-        raise RuntimeError("Claude desktop is running - quit it first, or use Force.")
+def guard():
+    """No way past this one. Writing into files the app has open risks the
+    history, and the app would overwrite the row from its own memory anyway."""
+    if app_running():
+        raise RuntimeError("Claude desktop is running - quit it first, then retry")
 
 def scope_dir(acct, org): return f"{SESS}/{acct}/{org}"
 
-def op_copy(src_path, dst_acct, dst_org, move=False, force=False):
-    guard(force); owned(src_path)
+def op_copy(src_path, dst_acct, dst_org, move=False):
+    guard(); owned(src_path)
     rec = read_rec(src_path)
     if not rec: raise RuntimeError("source chat unreadable")
     sid = rec["sessionId"]
@@ -541,12 +543,12 @@ def template_record(d):
     try: return json.load(open(max(recs, key=os.path.getmtime), encoding="utf-8")) or {}
     except Exception: return {}
 
-def op_import(path, acct, org, force=False):
+def op_import(path, acct, org):
     """Give a CLI or VS Code session the per-account record it never had, so an
     account claims it and it becomes an ordinary chat: listed by Claude, and
     from here on copyable, movable and deletable like any other. The transcript
     is not touched, so the session stays resumable where it came from."""
-    guard(force)
+    guard()
     if not (str(path).endswith(".jsonl") and under(PROJ, str(path))):
         raise RuntimeError(f"path is outside the projects folder\n  path: {path}\n  root: {PROJ}")
     info = read_session(path)
@@ -594,12 +596,12 @@ def relink(src, dst):
     try: shutil.copy2(src, dst); return (0, 1)
     except Exception: return (0, 0)
 
-def op_set_folder(path, folder, force=False):
+def op_set_folder(path, folder):
     """Point a chat at a folder. Its cwd is two things at once: the folder Claude
     names in its header and resumes in, and where the conversation is looked up.
     So changing only the cwd would show the new folder and lose the conversation
     with it - every transcript has to be findable under the new name too."""
-    guard(force); owned(path)
+    guard(); owned(path)
     rec = read_rec(path)
     if not rec: raise RuntimeError("chat unreadable")
     was    = rec.get("cwd") or ""
@@ -623,8 +625,8 @@ def op_set_folder(path, folder, force=False):
     json.dump(rec, open(path, "w", encoding="utf-8"), indent=1)
     return {"ok": True, "cwd": folder, "was": was, "linked": linked, "copied": copied}
 
-def op_rename(path, title, force=False):
-    guard(force); owned(path)
+def op_rename(path, title):
+    guard(); owned(path)
     rec = read_rec(path)
     if not rec: raise RuntimeError("chat unreadable")
     snapshot(path, "rename")
@@ -632,8 +634,8 @@ def op_rename(path, title, force=False):
     json.dump(rec, open(path,"w"), indent=1)
     return {"ok": True, "title": title}
 
-def op_delete(path, force=False):
-    guard(force); owned(path)
+def op_delete(path):
+    guard(); owned(path)
     rec = read_rec(path); sid = rec["sessionId"]
     snapshot(path, "delete")
     d = os.path.dirname(path)
@@ -641,9 +643,9 @@ def op_delete(path, force=False):
     os.remove(path)
     return {"ok": True}
 
-def op_undelete(acct, org, sid, force=False):
+def op_undelete(acct, org, sid):
     """Restore from the vault, or from any other account that still has it."""
-    guard(force)
+    guard()
     short = sid[len("local_"):]
     dst_dir = scope_dir(acct, org)
     src = None
@@ -1536,7 +1538,7 @@ def write_transcript(path, msgs, cwd, sid):
             prev = u
     return path
 
-def op_cursor_import(cid, acct, org, force=False):
+def op_cursor_import(cid, acct, org):
     """Convert one Cursor conversation into a Claude chat.
 
     This is the one place Ferry writes a transcript rather than only the little
@@ -1544,7 +1546,7 @@ def op_cursor_import(cid, acct, org, force=False):
     its conversations in a database. The file is named after the Cursor
     conversation, so converting the same chat twice rewrites the one file
     instead of leaving a second copy."""
-    guard(force)
+    guard()
     # an id in full is a primary key lookup; a prefix still has to be searched
     chat = cursor_chat(cid) or next(
         (x for x in cursor_chats() if x["id"].startswith(cid)), None)
@@ -1558,10 +1560,10 @@ def op_cursor_import(cid, acct, org, force=False):
 
     dst = os.path.join(project_dir(chat["folder"]), chat["id"] + ".jsonl")
     write_transcript(dst, msgs, chat["folder"], chat["id"])
-    rec = op_import(dst, acct, org, force=force)
+    rec = op_import(dst, acct, org)
     # the record's title comes from the first prompt; Cursor already named it
     if chat["title"] and chat["title"] != "(unnamed)":
-        op_rename(rec["wrote"], chat["title"], force=force)
+        op_rename(rec["wrote"], chat["title"])
         rec["title"] = chat["title"]
     rec["messages"] = len(msgs)
     rec["transcript"] = dst
