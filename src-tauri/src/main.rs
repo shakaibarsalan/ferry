@@ -816,6 +816,95 @@ mod lockfile_tests {
     }
 }
 
+/// A record has to be writable while Claude is open, which is the whole point of
+/// the per-file swap. Windows-only because the swap and the retry are; on a Mac
+/// the guard still blocks the write and a plain `fs::write` is all there is.
+#[cfg(all(test, target_os = "windows"))]
+mod write_record_tests {
+    use std::fs;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ferry-write-record-{}-{}", tag, super::now_ms()));
+        let _ = fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn writes_a_new_record_and_leaves_no_temp_behind() {
+        let d = tmp_dir("new");
+        let dst = d.join("local_x.json");
+        let p = dst.to_string_lossy().to_string();
+        super::write_record(&p, "{\"a\":1}").unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "{\"a\":1}");
+        assert!(!d.join("local_x.json.ferrytmp").exists(), "the temp file is swapped away, not left");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn overwrites_an_existing_record_in_place() {
+        let d = tmp_dir("over");
+        let dst = d.join("local_y.json");
+        let p = dst.to_string_lossy().to_string();
+        fs::write(&dst, "old").unwrap();
+        super::write_record(&p, "new").unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "new", "the swap replaces the old bytes");
+        assert!(!d.join("local_y.json.ferrytmp").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_neither_a_record_nor_a_temp() {
+        // a folder that is not there: the temp write itself fails, and nothing
+        // half-made is left for Claude's local_*.json scan to find
+        let base = tmp_dir("gone");
+        let d = base.join("no-such-account");
+        let p = d.join("local_z.json").to_string_lossy().to_string();
+        assert!(super::write_record(&p, "x").is_err());
+        assert!(!d.join("local_z.json").exists() && !d.join("local_z.json.ferrytmp").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_transfer_goes_through_while_claude_is_open_unless_claude_would_undo_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tmp_dir("open");
+        let root = super::Root { id: "t".into(), path: d.to_string_lossy().to_string(),
+                                 label: String::new(), builtin: false };
+        // Claude's lockfile, held the way Chromium holds it (see lockfile_tests)
+        let holder = fs::OpenOptions::new().read(true).write(true).create(true)
+            .access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000)   // read, write, delete
+            .share_mode(0x7)
+            .custom_flags(0x0400_0000)                               // delete on close
+            .open(d.join("lockfile")).unwrap();
+        assert!(super::guard_in(&root).is_err(), "an edit of a record Claude holds still waits");
+        assert!(super::guard_transfer(&root).is_ok(), "a transfer does not");
+
+        let rec = d.join("local_q.json").to_string_lossy().to_string();
+        let tomb = d.join("deleted_q");
+        let tomb_s = tomb.to_string_lossy().to_string();
+        assert!(super::refuse_resurrect(&root, &rec, &tomb_s).is_ok(), "a chat new to the account is fine");
+        fs::write(&tomb, "1").unwrap();
+        assert!(super::refuse_resurrect(&root, &rec, &tomb_s).is_err(),
+                "one in its deleted list is what an open Claude would delete again");
+
+        drop(holder);
+        assert!(super::refuse_resurrect(&root, &rec, &tomb_s).is_ok(), "once Claude has quit it can come back");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn remove_record_takes_the_file_and_reports_a_missing_one() {
+        let d = tmp_dir("rm");
+        let dst = d.join("local_r.json");
+        let p = dst.to_string_lossy().to_string();
+        fs::write(&dst, "x").unwrap();
+        super::remove_record(&p).unwrap();
+        assert!(!dst.exists(), "the record is gone");
+        assert!(super::remove_record(&p).is_err(), "a second remove reports it is already gone");
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
 /// The vault is shared with the CLI, so a Windows stamp has to be the same shape
 /// the CLI writes and sort against it correctly. Windows-only because on a Mac
 /// `date` has always answered in this shape.
@@ -868,6 +957,94 @@ fn guard_in(root: &Root) -> Result<(), String> {
         format!("Claude is open with the {} profile. Quit that window first, then retry.", root.label)
     })
 }
+
+/// The guard for a transfer: a chat copied, moved or added into an account.
+/// On Windows that no longer waits for Claude. The record it writes is new to
+/// that account - Claude has never loaded it, so there is nothing in Claude's
+/// memory for it to clash with - and it is swapped in whole (`write_record`),
+/// so an open Claude never reads half of it. Claude lists it on its next reload
+/// or restart. Edits to a record Claude may already hold - rename, folder,
+/// delete, restore - keep `guard_in`: Claude keeps those in memory and writes
+/// its own copy back over them. Elsewhere a transfer waits for Claude to quit,
+/// as every write always has.
+#[cfg(target_os = "windows")]
+fn guard_transfer(_root: &Root) -> Result<(), String> { Ok(()) }
+#[cfg(not(target_os = "windows"))]
+fn guard_transfer(root: &Root) -> Result<(), String> { guard_in(root) }
+
+/// The one transfer an open Claude would undo: a chat in this account's deleted
+/// list is one Claude holds as deleted, so writing it back while that Claude
+/// runs is exactly the write it reverses - the rule Nearby's receive follows
+/// too. Only Windows gets here with Claude open; elsewhere `guard_transfer` has
+/// already refused, so there is nothing to check.
+#[cfg(target_os = "windows")]
+fn refuse_resurrect(root: &Root, rec: &str, tomb: &str) -> Result<(), String> {
+    if Path::new(tomb).exists() && !Path::new(rec).exists() && app_running_in(&root.path) {
+        return Err(if root.label.is_empty() {
+            "That chat is in this account's deleted list, and Claude is open, so Claude could delete it again. Quit Claude, then retry.".to_string()
+        } else {
+            format!("That chat is in this account's deleted list, and Claude is open with the {} profile, so Claude could delete it again. Quit that window, then retry.", root.label)
+        });
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "windows"))]
+fn refuse_resurrect(_root: &Root, _rec: &str, _tomb: &str) -> Result<(), String> { Ok(()) }
+
+/// A file another process holds for a moment: a sharing violation, or access
+/// denied, which is what replacing or deleting a file someone has open without
+/// delete sharing gets. Worth a short retry; any other error is not.
+#[cfg(target_os = "windows")]
+fn held_briefly(e: &std::io::Error) -> bool { matches!(e.raw_os_error(), Some(32) | Some(5)) }
+
+/// Write a record so an open Claude never sees half of it. The bytes go to a
+/// sibling first - named so Claude's `local_*.json` scan skips it - and are
+/// swapped in with one same-directory rename (replace-existing), retried
+/// briefly while Claude happens to be reading the old file. Elsewhere a write
+/// waits for Claude to quit, so a plain write has always been safe and that is
+/// all this is.
+#[cfg(target_os = "windows")]
+fn write_record(dst: &str, bytes: &str) -> Result<(), String> {
+    let tmp = format!("{}.ferrytmp", dst);
+    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    let mut i = 0u64;
+    loop {
+        match fs::rename(&tmp, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) if held_briefly(&e) && i < 10 => {
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(40 * i));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(format!("could not write {}: {}", dst, e));
+            }
+        }
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn write_record(dst: &str, bytes: &str) -> Result<(), String> {
+    fs::write(dst, bytes).map_err(|e| e.to_string())
+}
+
+/// Take a moved chat's record out of the account it left, retried the same way
+/// while Claude is reading it. The caller took a snapshot first, so a removal
+/// that still fails leaves a copy behind, never a loss.
+#[cfg(target_os = "windows")]
+fn remove_record(path: &str) -> std::io::Result<()> {
+    let mut i = 0u64;
+    loop {
+        match fs::remove_file(path) {
+            Err(e) if held_briefly(&e) && i < 10 => {
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(40 * i));
+            }
+            r => return r,
+        }
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn remove_record(path: &str) -> std::io::Result<()> { fs::remove_file(path) }
 fn snapshot(p: &str, tag: &str) {
     if !Path::new(p).exists() { return; }
     let name = Path::new(p).file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -2685,21 +2862,26 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
         None => src.clone(),
         Some(id) => root_by_id(id).ok_or("Ferry is no longer reading that folder")?,
     };
-    // A move takes the record out of the source as well, so both ends have to
-    // be free of a Claude that could put it back.
-    if mv { guard_in(&src)?; }
-    guard_in(&dst)?;
+    // A move takes the record out of the source as well, so wherever a transfer
+    // waits for Claude, both ends have to be free of a Claude that could put it
+    // back. On Windows it goes ahead: if the Claude that has the source open
+    // writes its copy back before it reloads, the chat ends up in both accounts
+    // - a copy, never a loss - which is why the card says to reload.
+    if mv { guard_transfer(&src)?; }
+    guard_transfer(&dst)?;
     let rec = read_json(&path).ok_or("source unreadable")?;
     let sid = rec["sessionId"].as_str().ok_or("no sessionId")?.to_string();
     let short = sid.trim_start_matches("local_").to_string();
     let dst_dir = format!("{}/{}/{}", sess_in(&dst.path), acct, org);
     fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
-    let dst = format!("{}/{}.json", dst_dir, sid);
+    let rec_at = format!("{}/{}.json", dst_dir, sid);
+    refuse_resurrect(&dst, &rec_at, &format!("{}/deleted_{}", dst_dir, short))?;
+    let dst = rec_at;
 
     let mut out = rec.clone();
     if let Some(o) = out.as_object_mut() { for k in ACCOUNT_SCOPED { o.remove(k); } }
     snapshot(&dst, "overwrite");
-    fs::write(&dst, serde_json::to_string_pretty(&out).unwrap()).map_err(|e| e.to_string())?;
+    write_record(&dst, &serde_json::to_string_pretty(&out).unwrap())?;
 
     let tomb = format!("{}/deleted_{}", dst_dir, short);
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
@@ -2707,7 +2889,7 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     if mv {
         snapshot(&path, "moved-out");
         let src_dir = Path::new(&path).parent().unwrap().to_string_lossy().to_string();
-        let _ = fs::remove_file(&path);
+        let _ = remove_record(&path);
         let _ = fs::write(format!("{}/deleted_{}", src_dir, short), now_ms().to_string());
     }
     Ok(json!({ "ok": true, "wrote": dst, "moved": mv }))
@@ -2831,7 +3013,7 @@ fn import_session(path: String, acct: String, org: String, root: Option<String>)
         None => primary_root(),
         Some(id) => root_by_id(id).ok_or("Ferry is no longer reading that folder")?,
     };
-    guard_in(&dst)?;
+    guard_transfer(&dst)?;
     // A Cursor chat has no transcript to point at - its conversation lives in
     // Cursor's database - so one is written first, and from there it is an
     // ordinary import. Nearby's receive (share.rs) is the other place Ferry
@@ -2849,7 +3031,7 @@ fn import_session(path: String, acct: String, org: String, root: Option<String>)
                     if let Some(w) = out["wrote"].as_str() {
                         if let Some(mut r) = read_json(w) {
                             r["title"] = json!(t);
-                            let _ = fs::write(w, serde_json::to_string_pretty(&r).unwrap());
+                            let _ = write_record(w, &serde_json::to_string_pretty(&r).unwrap());
                         }
                     }
                 }
@@ -2905,9 +3087,10 @@ fn import_session_at(path: &str, acct: &str, org: &str, dst: &Root) -> Result<Va
         for k in INHERIT { if !t[k].is_null() { rec[k] = t[k].clone(); } }
     }
 
+    refuse_resurrect(dst, &format!("{}/{}.json", dst_dir, id), &format!("{}/deleted_{}", dst_dir, sid))?;
     let dst = format!("{}/{}.json", dst_dir, id);
     snapshot(&dst, "import");
-    fs::write(&dst, serde_json::to_string_pretty(&rec).unwrap()).map_err(|e| e.to_string())?;
+    write_record(&dst, &serde_json::to_string_pretty(&rec).unwrap())?;
     let tomb = format!("{}/deleted_{}", dst_dir, sid);
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
 
