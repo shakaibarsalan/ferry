@@ -766,8 +766,13 @@ fn claude_dirs_in(appdata: &str, local: &str) -> Vec<String> {
 #[cfg(target_os = "windows")]
 fn app_running() -> bool {
     // a Store install and a direct install can sit side by side, and the one
-    // that is running need not be the one with the newest chats
-    claude_dirs().iter().any(|d| lock_held(&format!("{}\\lockfile", d)))
+    // that is running need not be the one with the newest chats - nor need it
+    // be one of Claude's own folders at all: a window started with
+    // --user-data-dir runs from a folder added under Locations, and asking only
+    // the built-in ones answered "quit" while that window was plainly open
+    claude_dirs().into_iter()
+        .chain(roots().into_iter().map(|r| r.path))
+        .any(|d| lock_held(&format!("{}\\lockfile", d)))
 }
 
 #[cfg(target_os = "windows")]
