@@ -1129,7 +1129,7 @@ fn hand_to_open_claude(root: &Root, acct: &str, cli: &str) -> Option<String> {
         // --user-data-dir; the same switch hands the link to that window, and
         // the copy started here exits once it has
         let dir = root.path.replace('/', "\\");
-        winproc::claude_app_exe().map(|exe| Command::new(exe)
+        cursor::winproc::claude_app_exe().map(|exe| Command::new(exe)
             .arg(format!("--user-data-dir={}", dir.trim_end_matches('\\')))
             .arg(&url).spawn().is_ok()).unwrap_or(false)
     };
@@ -1716,7 +1716,7 @@ fn pid_alive(pid: u32) -> bool { winproc::alive(pid) }
 /// Ferry mid-way through such a run ("Behavior:Win32/DefenseEvasion.A!ml").
 /// kernel32 answers the same two questions in-process, with no child at all.
 #[cfg(windows)]
-mod winproc {
+pub(crate) mod winproc {
     use std::ffi::c_void;
     type Handle = *mut c_void;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -1764,7 +1764,7 @@ mod winproc {
                         let mut n = buf.len() as u32;
                         if QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut n) != 0 {
                             let p = String::from_utf16_lossy(&buf[..n as usize]);
-                            if super::is_claude_app_exe(&p) { found = Some(p); }
+                            if crate::is_claude_app_exe(&p) { found = Some(p); }
                         }
                         CloseHandle(h);
                     }
