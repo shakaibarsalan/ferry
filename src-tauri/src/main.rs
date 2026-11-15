@@ -984,6 +984,25 @@ mod lineage_tests {
         assert_eq!(super::mend_lineage_with(&d.to_string_lossy(), |_| None), 0, "nothing left to mend");
         let _ = fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn a_fork_claude_adopted_gets_its_link_back_and_nothing_else() {
+        let d = std::env::temp_dir().join(format!("ferry-restore-{}", super::now_ms()));
+        fs::create_dir_all(&d).unwrap();
+        // what Claude's adopt writes: its own id and title, no link to a parent
+        put(&d, json!({"sessionId": "local_conv-c", "cliSessionId": "conv-c", "title": "Claude's title"}));
+        let src = json!({"sessionId": "local_c", "cliSessionId": "conv-c", "title": "Ferry's title",
+                         "forkedFromSessionId": "local_p",
+                         "spawnedFrom": {"sessionId": "local_p", "userFork": true}});
+        let p = d.join("local_conv-c.json").to_string_lossy().to_string();
+        super::restore_lineage(&p, &src);
+        let r: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(r["forkedFromSessionId"], "local_p");
+        assert_eq!(r["spawnedFrom"]["userFork"], true);
+        assert_eq!(r["sessionId"], "local_conv-c", "Claude's id stays");
+        assert_eq!(r["title"], "Claude's title", "only the link is copied");
+        let _ = fs::remove_dir_all(&d);
+    }
 }
 
 /// Handing a chat to an open Claude through `claude://resume`. Nothing here
@@ -3280,10 +3299,29 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     // or one that arrives before its parent's new id is known, has no parent.
     let src_dir = Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let forks = if same_dir(&src_dir, &dst_dir) { vec![] } else { forks_of(&src_dir, &sid) };
+    if mv {
+        if let Some((_, r)) = std::iter::once((path.clone(), rec.clone())).chain(forks.iter().cloned())
+            .find(|(_, r)| busy_in_claude(r))
+        {
+            let msg = "is working in Claude right now, so the window running it would write it straight back. Move it once it has finished; a copy works now.";
+            return Err(format!("\u{201c}{}\u{201d} {}", r["title"].as_str().unwrap_or("This chat"), msg));
+        }
+    }
     let first = transfer_one(&path, &rec, &dst, &acct, &dst_dir, mv)?;
-    let carried = forks.iter()
-        .map(|(p, r)| transfer_one(p, r, &dst, &acct, &dst_dir, mv))
-        .filter(|landed| landed.is_ok()).count();
+    let mut live_forks: Vec<(String, Value)> = vec![];
+    if first.live && parent_of(&rec).is_some() { live_forks.push((first.wrote.clone(), rec.clone())); }
+    let mut carried = 0;
+    for (p, r) in &forks {
+        if let Ok(landed) = transfer_one(p, r, &dst, &acct, &dst_dir, mv) {
+            carried += 1;
+            if landed.live { live_forks.push((landed.wrote, r.clone())); }
+        }
+    }
+    if !live_forks.is_empty() {
+        // let Claude finish writing the records it adopted before adding to them
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        for (wrote, src) in &live_forks { restore_lineage(wrote, src); }
+    }
     // every fork in that account now finds its parent by its id there
     let relinked = mend_lineage(&dst_dir);
     Ok(json!({ "ok": true, "wrote": first.wrote, "moved": mv, "live": first.live, "newId": first.new_id,
@@ -3295,19 +3333,16 @@ struct Landed { wrote: String, live: bool, new_id: bool }
 /// One chat into one account. With that account open in a running Claude, it
 /// is handed to Claude through its own door (hand_to_open_claude): Claude
 /// adopts it and shows it now, and writes the record itself, so Ferry writes
-/// none (two records for one conversation would list it twice). A fork is
-/// always written instead: Claude's adopt keeps no link to a parent, and the
-/// written record does - it shows when that window next starts.
+/// none (two records for one conversation would list it twice). That goes for
+/// a fork too; copy_chat puts its link to the parent back afterwards.
 fn transfer_one(path: &str, rec: &Value, dst: &Root, acct: &str, dst_dir: &str, mv: bool)
     -> Result<Landed, String>
 {
     let sid = rec["sessionId"].as_str().ok_or("no sessionId")?.to_string();
     let short = sid.trim_start_matches("local_").to_string();
-    if parent_of(rec).is_none() {
-        if let Some(wrote) = rec["cliSessionId"].as_str().and_then(|cli| hand_to_open_claude(dst, acct, cli)) {
-            if mv { move_out(path, &short); }
-            return Ok(Landed { wrote, live: true, new_id: false });
-        }
+    if let Some(wrote) = rec["cliSessionId"].as_str().and_then(|cli| hand_to_open_claude(dst, acct, cli)) {
+        if mv { move_out(path, &short); }
+        return Ok(Landed { wrote, live: true, new_id: false });
     }
 
     // the chat's own id, unless that account deleted it and its Claude is open
@@ -3350,6 +3385,35 @@ fn repoint_parent(rec: &mut Value, old: &str, new: &str) -> bool {
         changed = true;
     }
     changed
+}
+
+/// The fields a fork's link to its parent is made of.
+const LINEAGE: [&str; 5] = ["forkedFromSessionId", "forkedAtMessageUuid", "spawnedFrom",
+                            "dispatchParentId", "dispatchParentOrigin"];
+
+/// Claude's adopt keeps no link to a parent, so a fork handed to an open
+/// Claude is listed there at once but on its own. Put the link back on the
+/// record Claude wrote, for the window to read the next time it starts.
+fn restore_lineage(wrote: &str, src: &Value) {
+    let Some(mut r) = read_json(wrote) else { return };
+    let mut changed = false;
+    for k in LINEAGE {
+        if !src[k].is_null() && r[k].is_null() { r[k] = src[k].clone(); changed = true; }
+    }
+    if changed { let _ = write_record(wrote, &serde_json::to_string_pretty(&r).unwrap()); }
+}
+
+/// A chat Claude is working on right now: its conversation was written to in
+/// the last two minutes. Moving it out from under the window that runs it
+/// does not move it - that window writes its record straight back, and two
+/// windows would be writing one conversation.
+fn busy_in_claude(rec: &Value) -> bool {
+    let recent = std::time::Duration::from_secs(120);
+    transcripts_for(rec).iter()
+        .filter(|t| t["exists"].as_bool().unwrap_or(false))
+        .filter_map(|t| t["path"].as_str())
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .any(|m| m.elapsed().map(|e| e < recent).unwrap_or(true))
 }
 
 /// The records in one account-and-organisation folder.

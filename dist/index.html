@@ -329,6 +329,8 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
  font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim)}
 .nbf em{font-style:normal;color:var(--warn);font-family:-apple-system,"Segoe UI",sans-serif}
 .askc .nbnote{font-size:11px;color:var(--faint)}
+.info{display:inline-block;margin-left:3px;cursor:help;font-style:normal;opacity:.7}
+.info:hover,.info:focus{opacity:1;color:var(--ink);outline:none}
 .route .who{transition:opacity .3s}
 .route .who.out{opacity:.45}                                   /* where a moved chat left */
 .askc .stat{margin-top:16px;text-align:center;font-size:13px;font-weight:560;color:var(--ink)}
@@ -374,6 +376,9 @@ const MODK=e=>MAC?e.metaKey:e.ctrlKey;           // Cmd on a Mac, Ctrl elsewhere
 // second case, appended only when Claude is actually open. Elsewhere a write
 // still waits for a quit, so there is nothing to append.
 const LIVE=WIN||MAC;
+// A short line on a card, the rest on hover or keyboard focus: an i in a circle
+// carrying the whole explanation as its title (and for screen readers).
+const info=t=>' <span class=info tabindex=0 title="'+esc(t)+'" aria-label="'+esc(t)+'">ⓘ</span>';
 const reloadHint=on=>(LIVE&&on&&S&&S.appRunning)?" · Claude shows it the next time it opens that account":"";
 const MARK=`<svg class=mk viewBox="0 0 100 100" aria-hidden=true>\n <defs><mask id="gap">\n <rect width="100" height="100" fill="#fff"/>\n <rect x="57.4" y="38.9" width="18.6" height="11.8" fill="#000"/>\n </mask></defs>\n <path mask="url(#gap)" fill="currentColor" fill-rule="evenodd"\n d="M33 26.9h24.6a11.2 11.2 0 0 1 11.2 11.2v14.8a11.2 11.2 0 0 1-11.2 11.2H33\n A11.2 11.2 0 0 1 21.8 52.9V38.1A11.2 11.2 0 0 1 33 26.9Z\n M33.9 32.9h22.8a6 6 0 0 1 6 6v13.2a6 6 0 0 1-6 6H33.9a6 6 0 0 1-6-6V38.9a6 6 0 0 1 6-6Z"/>\n <path mask="url(#gap)" fill="currentColor" d="M31.2 63.4h14.1l-15 13.4Z"/>\n <rect x="42.5" y="42" width="33.5" height="5.6" rx="2.8" fill="#d97757"/>\n <path fill="#d97757" d="M81.2 44.8 70.8 37.9v13.8Z"/>\n </svg>`;
 let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0;
@@ -509,8 +514,7 @@ async function transfer(path,t,mv){
       ? "Written, but no Cursor workspace matched that folder, so it is in no chat list"
       : ok+(res&&res.newId?" as a new chat":"")+                       // see transfer_id
         (res&&res.forks?" with its "+res.forks+" fork"+(res.forks>1?"s":""):"")+   // see forks_of
-        (res&&res.live?" · open in Claude now"+(res.forks?"; forks show when that window next starts":"")
-                      :reloadHint(!toCur)));                            // see hand_to_open_claude
+        (res&&res.live?" · open in Claude now":reloadHint(!toCur)));   // see hand_to_open_claude
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
@@ -769,10 +773,11 @@ function ask(p,t,mv){
      :'<p>It is added to '+to+' and stays in '+from+'.</p>')+
     (toCur&&S.cursorRunning?'<p class=warn>Cursor is open, so Ferry can\'t write yet. Quit Cursor, then confirm.</p>':'')+
     (!toCur&&S.appRunning?(LIVE
-      ?'<p class=nbnote>Claude is open, and that is fine: if '+to+' is the account signed in there, Ferry hands the chat to Claude and it opens straight away. '+
-        'Otherwise Claude shows it the next time it opens '+to+'.'+
-        (mv===false||imp?'':' A window that has '+from+' open keeps listing it until it next starts: '+
-          'don\'t open or delete it there, or Claude may keep a copy, or delete the conversation the moved chat uses.')+'</p>'
+      ?'<p class=nbnote>Claude is open, that’s fine'+(mv===false||imp?'':'. Leave the old copy in '+from+' alone')+
+        info('If '+short(t)+' is signed in to an open Claude window, the chat opens there now; if not, Claude shows it '+
+          'the next time it opens '+short(t)+'.'+(mv===false||imp?'':' A window that has '+short(s)+' open keeps '+
+          'listing it until that window restarts. Opening it there makes Claude keep a copy; deleting it there can '+
+          'delete the conversation the moved chat uses.'))+'</p>'
       :'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>'):'')+
     '<div class=askb>'+btn("an","Cancel")+
       (toCur?btn("ago","Convert",1)
@@ -1170,7 +1175,8 @@ function askDelete(){
     '<div class=ct>'+esc(c.title)+'</div>'+
     '<p>It is removed from '+esc(short(s))+'. The conversation itself stays on disk and in your archive, '+
       'so you can restore it from the deleted list.</p>'+
-    (S.appRunning?'<p class=nbnote>If Claude has this account open, quit it first: an open Claude would put the chat back.</p>':'')+
+    (S.appRunning?'<p class=nbnote>Claude is open: quit it in this account first'+
+      info('An open Claude keeps this chat in memory and would put it back after Ferry removes it.')+'</p>':'')+
     '<div class=askb><button class=btn id=an>Cancel</button><button class="btn p" id=ago>Delete</button></div></div>';
   a.className="on";
   $("#an").onclick=closeAsk;
