@@ -872,7 +872,7 @@ mod write_record_tests {
     }
 
     #[test]
-    fn a_transfer_goes_through_while_claude_is_open_unless_claude_would_undo_it() {
+    fn a_transfer_goes_through_while_claude_is_open_and_a_deleted_chat_comes_in_new() {
         use std::os::windows::fs::OpenOptionsExt;
         let d = tmp_dir("open");
         let root = super::Root { id: "t".into(), path: d.to_string_lossy().to_string(),
@@ -886,16 +886,29 @@ mod write_record_tests {
         assert!(super::guard_in(&root).is_err(), "an edit of a record Claude holds still waits");
         assert!(super::guard_transfer(&root).is_ok(), "a transfer does not");
 
-        let rec = d.join("local_q.json").to_string_lossy().to_string();
-        let tomb = d.join("deleted_q");
-        let tomb_s = tomb.to_string_lossy().to_string();
-        assert!(super::refuse_resurrect(&root, &rec, &tomb_s).is_ok(), "a chat new to the account is fine");
-        fs::write(&tomb, "1").unwrap();
-        assert!(super::refuse_resurrect(&root, &rec, &tomb_s).is_err(),
-                "one in its deleted list is what an open Claude would delete again");
+        // an account's folder inside that profile
+        let acct = d.join("acct").join("org");
+        fs::create_dir_all(&acct).unwrap();
+        let dir = acct.to_string_lossy().to_string();
+        let id = |sid: &str| super::transfer_id(&root, &dir, sid);
+        assert_eq!(id("local_q"), "local_q", "a chat new to the account keeps its own id");
+
+        fs::write(acct.join("deleted_q"), "1").unwrap();
+        let fresh = id("local_q");
+        assert_ne!(fresh, "local_q", "one in its deleted list comes in as a new chat while Claude is open");
+        assert!(fresh.starts_with("local_") && fresh.len() == "local_".len() + 36, "a uuid-shaped id: {fresh}");
+        assert_eq!(id("local_q"), fresh, "derived, so a retried move lands on the same record");
+
+        fs::write(acct.join(format!("deleted_{}", fresh.trim_start_matches("local_"))), "1").unwrap();
+        let again = id("local_q");
+        assert!(again != fresh && again != "local_q", "moved back and forth twice: a third id");
+
+        fs::write(acct.join("local_q.json"), "{}").unwrap();
+        assert_eq!(id("local_q"), "local_q", "a record that is live again is simply updated");
+        fs::remove_file(acct.join("local_q.json")).unwrap();
 
         drop(holder);
-        assert!(super::refuse_resurrect(&root, &rec, &tomb_s).is_ok(), "once Claude has quit it can come back");
+        assert_eq!(id("local_q"), "local_q", "with Claude quit it is a plain restore under its own id");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -979,24 +992,35 @@ fn guard_transfer(_root: &Root) -> Result<(), String> { Ok(()) }
 #[cfg(not(target_os = "windows"))]
 fn guard_transfer(root: &Root) -> Result<(), String> { guard_in(root) }
 
-/// The one transfer an open Claude would undo: a chat in this account's deleted
-/// list is one Claude holds as deleted, so writing it back while that Claude
-/// runs is exactly the write it reverses - the rule Nearby's receive follows
-/// too. Only Windows gets here with Claude open; elsewhere `guard_transfer` has
-/// already refused, so there is nothing to check.
+/// The id a transfer writes a chat under in `dir`, an account's folder. A chat
+/// in that account's deleted list is one an open Claude holds as deleted, and
+/// writing it back under that id is exactly the write Claude reverses. So while
+/// that Claude is open it arrives as a new chat with an id of its own and the
+/// deleted one stays deleted - the rule Nearby's receive follows. The new id is
+/// derived, not random, so a retried move lands on the same record instead of
+/// making another. With Claude quit it is the chat's own id, and writing it
+/// clears the tombstone: a plain restore, as before. Only Windows gets here
+/// with Claude open; elsewhere `guard_transfer` has already waited for a quit.
 #[cfg(target_os = "windows")]
-fn refuse_resurrect(root: &Root, rec: &str, tomb: &str) -> Result<(), String> {
-    if Path::new(tomb).exists() && !Path::new(rec).exists() && app_running_in(&root.path) {
-        return Err(if root.label.is_empty() {
-            "That chat is in this account's deleted list, and Claude is open, so Claude could delete it again. Quit Claude, then retry.".to_string()
-        } else {
-            format!("That chat is in this account's deleted list, and Claude is open with the {} profile, so Claude could delete it again. Quit that window, then retry.", root.label)
-        });
+fn transfer_id(root: &Root, dir: &str, sid: &str) -> String {
+    let tomb = |id: &str| Path::new(&format!("{}/deleted_{}", dir, id.trim_start_matches("local_"))).exists();
+    let live = |id: &str| Path::new(&format!("{}/{}.json", dir, id)).exists();
+    if !tomb(sid) || live(sid) || !app_running_in(&root.path) { return sid.to_string(); }
+    use sha2::{Digest, Sha256};
+    for n in 0..1000u32 {
+        let h = Sha256::digest(format!("ferry-transfer|{}|{}|{}", norm_dir(dir), sid, n).as_bytes());
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&h[..16]);
+        b[6] = (b[6] & 0x0f) | 0x40;   // shaped like the v4 uuids Claude gives its chats
+        b[8] = (b[8] & 0x3f) | 0x80;
+        let x: String = b.iter().map(|v| format!("{v:02x}")).collect();
+        let id = format!("local_{}-{}-{}-{}-{}", &x[0..8], &x[8..12], &x[12..16], &x[16..20], &x[20..32]);
+        if !tomb(&id) { return id; }
     }
-    Ok(())
+    sid.to_string()
 }
 #[cfg(not(target_os = "windows"))]
-fn refuse_resurrect(_root: &Root, _rec: &str, _tomb: &str) -> Result<(), String> { Ok(()) }
+fn transfer_id(_root: &Root, _dir: &str, sid: &str) -> String { sid.to_string() }
 
 /// A file another process holds for a moment: a sharing violation, or access
 /// denied, which is what replacing or deleting a file someone has open without
@@ -2957,16 +2981,19 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     let short = sid.trim_start_matches("local_").to_string();
     let dst_dir = format!("{}/{}/{}", sess_in(&dst.path), acct, org);
     fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
-    let rec_at = format!("{}/{}.json", dst_dir, sid);
-    refuse_resurrect(&dst, &rec_at, &format!("{}/deleted_{}", dst_dir, short))?;
-    let dst = rec_at;
+    // the chat's own id, unless that account deleted it and its Claude is open
+    let id = transfer_id(&dst, &dst_dir, &sid);
+    let dst = format!("{}/{}.json", dst_dir, id);
 
     let mut out = rec.clone();
     if let Some(o) = out.as_object_mut() { for k in ACCOUNT_SCOPED { o.remove(k); } }
+    if id != sid { out["sessionId"] = json!(id); }
     snapshot(&dst, "overwrite");
     write_record(&dst, &serde_json::to_string_pretty(&out).unwrap())?;
 
-    let tomb = format!("{}/deleted_{}", dst_dir, short);
+    // a tombstone under the id just written is a restore; one under the old id,
+    // when the chat came in under a new one, stays - Claude holds it as deleted
+    let tomb = format!("{}/deleted_{}", dst_dir, id.trim_start_matches("local_"));
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
 
     if mv {
@@ -2975,7 +3002,7 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
         let _ = remove_record(&path);
         let _ = fs::write(format!("{}/deleted_{}", src_dir, short), now_ms().to_string());
     }
-    Ok(json!({ "ok": true, "wrote": dst, "moved": mv }))
+    Ok(json!({ "ok": true, "wrote": dst, "moved": mv, "newId": id != sid }))
 }
 
 /// A chat started without picking a folder runs in a workspace the app makes
@@ -3155,8 +3182,9 @@ fn import_session_at(path: &str, acct: &str, org: &str, dst: &Root) -> Result<Va
     // The id the chat keeps for good, derived from the session it already has:
     // importing the same session twice updates one record instead of making a
     // second, and a later copy to another account carries the same id, exactly
-    // as a copy between two accounts does.
-    let id = format!("local_{}", sid);
+    // as a copy between two accounts does. Unless the account deleted it while
+    // its Claude is open: then it comes in as a new chat (see transfer_id).
+    let id = transfer_id(dst, &dst_dir, &format!("local_{}", sid));
     let mut rec = json!({
         "sessionId": id, "cliSessionId": sid,
         "cwd": cwd, "originCwd": cwd,
@@ -3170,14 +3198,13 @@ fn import_session_at(path: &str, acct: &str, org: &str, dst: &Root) -> Result<Va
         for k in INHERIT { if !t[k].is_null() { rec[k] = t[k].clone(); } }
     }
 
-    refuse_resurrect(dst, &format!("{}/{}.json", dst_dir, id), &format!("{}/deleted_{}", dst_dir, sid))?;
     let dst = format!("{}/{}.json", dst_dir, id);
     snapshot(&dst, "import");
     write_record(&dst, &serde_json::to_string_pretty(&rec).unwrap())?;
-    let tomb = format!("{}/deleted_{}", dst_dir, sid);
+    let tomb = format!("{}/deleted_{}", dst_dir, id.trim_start_matches("local_"));
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
 
-    Ok(json!({ "ok": true, "wrote": dst, "id": id,
+    Ok(json!({ "ok": true, "wrote": dst, "id": id, "newId": id != format!("local_{}", sid),
                "title": info["title"], "turns": info["turns"] }))
 }
 

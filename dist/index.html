@@ -507,7 +507,7 @@ async function transfer(path,t,mv){
         else drawRead(null);})()]);
     toast(res&&res.noWorkspace
       ? "Written, but no Cursor workspace matched that folder, so it is in no chat list"
-      : ok+reloadHint(!toCur));
+      : ok+(res&&res.newId?" as a new chat":"")+reloadHint(!toCur));   // see transfer_id
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
