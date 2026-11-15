@@ -507,7 +507,8 @@ async function transfer(path,t,mv){
         else drawRead(null);})()]);
     toast(res&&res.noWorkspace
       ? "Written, but no Cursor workspace matched that folder, so it is in no chat list"
-      : ok+(res&&res.newId?" as a new chat":"")+reloadHint(!toCur));   // see transfer_id
+      : ok+(res&&res.newId?" as a new chat":"")+                       // see transfer_id
+        (res&&res.live?" · open in Claude now":reloadHint(!toCur)));   // see hand_to_open_claude
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
@@ -766,7 +767,8 @@ function ask(p,t,mv){
      :'<p>It is added to '+to+' and stays in '+from+'.</p>')+
     (toCur&&S.cursorRunning?'<p class=warn>Cursor is open, so Ferry can\'t write yet. Quit Cursor, then confirm.</p>':'')+
     (!toCur&&S.appRunning?(WIN
-      ?'<p class=nbnote>Claude is open, and that is fine now: Ferry writes the chat safely. Reload or restart Claude afterwards to see it'+
+      ?'<p class=nbnote>Claude is open, and that is fine: if '+to+' is the account signed in there, Ferry hands the chat to Claude and it opens straight away. '+
+        'Otherwise Claude shows it the next time it opens '+to+
         (mv===false||imp?'.':'; until then don\'t open it in '+from+', or Claude may keep a copy there.')+'</p>'
       :'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>'):'')+
     '<div class=askb>'+btn("an","Cancel")+

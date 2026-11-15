@@ -925,6 +925,79 @@ mod write_record_tests {
     }
 }
 
+/// Handing a chat to an open Claude through `claude://resume`. Nothing here
+/// launches anything: every case stops before the link is sent, and the
+/// runner has no Claude for one to reach anyway.
+#[cfg(all(test, target_os = "windows"))]
+mod handoff_tests {
+    use std::fs;
+
+    #[test]
+    fn only_a_uuid_is_a_resumable_session_id() {
+        assert!(super::is_uuid("d537d026-9b1d-4090-8564-ab890136d83c"));
+        assert!(super::is_uuid("D537D026-9B1D-4090-8564-AB890136D83C"));
+        assert!(!super::is_uuid("local_d537d026-9b1d-4090-8564-ab890136d83c"));
+        assert!(!super::is_uuid("d537d026-9b1d-4090-8564-ab890136d83"));
+        assert!(!super::is_uuid("d537d026x9b1d-4090-8564-ab890136d83c"));
+        assert!(!super::is_uuid("../../../../windows/system32"));
+    }
+
+    #[test]
+    fn the_desktop_app_is_told_apart_from_the_cli_of_the_same_name() {
+        assert!(super::is_claude_app_exe(r"C:\Program Files\WindowsApps\Claude_5.11492.5.0_x64__pzs8sxrjxfjjc\app\Claude.exe"));
+        assert!(super::is_claude_app_exe(r"C:\Users\u\AppData\Local\AnthropicClaude\app-0.9.3\claude.exe"));
+        assert!(!super::is_claude_app_exe(r"C:\Users\u\AppData\Local\Claude-Data\claude_pzs8sxrjxfjjc\claude-code\2.1.325\806e0a45e6f5\claude.exe"));
+        assert!(!super::is_claude_app_exe(r"C:\Users\u\.local\bin\claude.exe"));
+    }
+
+    #[test]
+    fn nothing_is_handed_over_unless_that_account_is_open_in_a_running_claude() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = std::env::temp_dir().join(format!("ferry-handoff-{}", super::now_ms()));
+        let org = d.join("claude-code-sessions").join("acct-a").join("org");
+        fs::create_dir_all(&org).unwrap();
+        let root = super::Root { id: "t".into(), path: d.to_string_lossy().to_string(),
+                                 label: "T".into(), builtin: false };
+        let cli = "d537d026-9b1d-4090-8564-ab890136d83c";
+        assert!(super::hand_to_open_claude(&root, "acct-a", cli).is_none(), "no Claude open there");
+
+        let holder = fs::OpenOptions::new().read(true).write(true).create(true)
+            .access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000).share_mode(0x7)
+            .custom_flags(0x0400_0000).open(d.join("lockfile")).unwrap();
+        fs::write(d.join("config.json"), r#"{"lastKnownAccountUuid":"acct-b"}"#).unwrap();
+        assert!(super::hand_to_open_claude(&root, "acct-a", cli).is_none(), "open, but signed in to another account");
+
+        fs::write(d.join("config.json"), r#"{"lastKnownAccountUuid":"ACCT-A"}"#).unwrap();
+        assert!(super::hand_to_open_claude(&root, "acct-a", "not-a-session-id").is_none(), "not an id Claude takes");
+
+        fs::write(org.join(format!("deleted_{cli}")), "1").unwrap();
+        assert!(super::hand_to_open_claude(&root, "acct-a", cli).is_none(), "that account deleted it under this id");
+        drop(holder);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn waits_for_the_record_claude_writes_and_gives_up_in_time() {
+        let d = std::env::temp_dir().join(format!("ferry-wait-{}", super::now_ms()));
+        let org = d.join("org");
+        fs::create_dir_all(&org).unwrap();
+        let acct = d.to_string_lossy().to_string();
+        let t0 = std::time::Instant::now();
+        assert!(super::wait_for_record(&acct, "local_x", std::time::Duration::from_millis(400)).is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "gives up when it said it would");
+
+        let o = org.clone();
+        let w = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            fs::write(o.join("local_x.json"), "{}").unwrap();
+        });
+        let got = super::wait_for_record(&acct, "local_x", std::time::Duration::from_secs(5));
+        w.join().unwrap();
+        assert!(got.map(|p| p.ends_with("local_x.json")).unwrap_or(false), "sees the record when it lands");
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
 /// The vault is shared with the CLI, so a Windows stamp has to be the same shape
 /// the CLI writes and sort against it correctly. Windows-only because on a Mac
 /// `date` has always answered in this shape.
@@ -1021,6 +1094,118 @@ fn transfer_id(root: &Root, dir: &str, sid: &str) -> String {
 }
 #[cfg(not(target_os = "windows"))]
 fn transfer_id(_root: &Root, _dir: &str, sid: &str) -> String { sid.to_string() }
+
+/// Hand a chat to the Claude window that has `root` open, through the door
+/// Claude Code's own `/desktop` uses: `claude://resume?session=<id>` makes the
+/// running app adopt that conversation into the account it is signed in to,
+/// and show it, there and then. A record Ferry writes is read only when an
+/// account starts (LocalSessionManager reads the folder from
+/// initializeWithAccount and keeps the list in memory), so an open window
+/// would not list it until it restarted - and restarting stops every session
+/// running in it. Only when that window is open and signed in to `acct`;
+/// Claude writes the record itself, and this waits for it. None means nothing
+/// was handed over, and the caller writes the record as before, for Claude to
+/// read the next time it opens that account.
+#[cfg(target_os = "windows")]
+fn hand_to_open_claude(root: &Root, acct: &str, cli: &str) -> Option<String> {
+    if !is_uuid(cli) || !app_running_in(&root.path) { return None; }
+    let signed_in = read_json(&cfg_in(&root.path))
+        .and_then(|c| c["lastKnownAccountUuid"].as_str().map(str::to_lowercase));
+    if signed_in.as_deref() != Some(acct.to_lowercase().as_str()) { return None; }
+    let acct_dir = format!("{}/{}", sess_in(&root.path), acct);
+    let id = format!("local_{}", cli);
+    // a chat this account deleted under that very id is one Claude holds as
+    // deleted; it goes the other way, under an id of its own (transfer_id)
+    let tomb = format!("{}/*/deleted_{}", glob::Pattern::escape(&acct_dir), cli);
+    if glob::glob(&tomb).map(|mut g| g.next().is_some()).unwrap_or(false) { return None; }
+    let had = record_in(&acct_dir, &id);
+    let url = format!("claude://resume?session={}", cli);
+    let sent = if root.builtin {
+        // Claude's own folder: the app's registered link handler reaches the
+        // window started from the Start menu, with the app's own identity
+        shell_open(&url)
+    } else {
+        // a folder added under Locations is a window started with
+        // --user-data-dir; the same switch hands the link to that window, and
+        // the copy started here exits once it has
+        let dir = root.path.replace('/', "\\");
+        winproc::claude_app_exe().map(|exe| Command::new(exe)
+            .arg(format!("--user-data-dir={}", dir.trim_end_matches('\\')))
+            .arg(&url).spawn().is_ok()).unwrap_or(false)
+    };
+    if !sent { return None; }
+    if let Some((p, _)) = had {
+        // already in that account: Claude just brings it up
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        return Some(p);
+    }
+    wait_for_record(&acct_dir, &id, std::time::Duration::from_secs(8))
+}
+#[cfg(not(target_os = "windows"))]
+fn hand_to_open_claude(_root: &Root, _acct: &str, _cli: &str) -> Option<String> { None }
+
+/// What `claude://resume` accepts: Claude checks for exactly this uuid shape.
+#[cfg(target_os = "windows")]
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36 && s.char_indices()
+        .all(|(i, c)| if [8, 13, 18, 23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() })
+}
+
+/// The desktop app, not the Claude Code CLI that shares its file name.
+#[cfg(target_os = "windows")]
+fn is_claude_app_exe(p: &str) -> bool {
+    let l = p.to_lowercase().replace('/', "\\");
+    (l.contains("\\windowsapps\\claude_") && l.ends_with("\\app\\claude.exe"))
+        || (l.contains("\\anthropicclaude\\app-") && l.ends_with("\\claude.exe"))
+}
+
+/// A record named `id` in any of this account's organisation folders.
+#[cfg(target_os = "windows")]
+fn record_in(acct_dir: &str, id: &str) -> Option<(String, SystemTime)> {
+    let g = format!("{}/*/{}.json", glob::Pattern::escape(acct_dir), id);
+    glob::glob(&g).ok()?.flatten()
+        .filter_map(|p| fs::metadata(&p).and_then(|m| m.modified()).ok()
+            .map(|t| (p.to_string_lossy().to_string(), t)))
+        .next()
+}
+
+/// Wait for Claude to write the record it adopts a chat under.
+#[cfg(target_os = "windows")]
+fn wait_for_record(acct_dir: &str, id: &str, within: std::time::Duration) -> Option<String> {
+    let until = std::time::Instant::now() + within;
+    loop {
+        if let Some((p, _)) = record_in(acct_dir, id) { return Some(p); }
+        if std::time::Instant::now() >= until { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Open a link the way the shell does, so Claude's registered handler takes it
+/// with the app's own identity. On a thread of its own with COM set up, as
+/// ShellExecute asks, so the async command thread is left as it was.
+#[cfg(target_os = "windows")]
+fn shell_open(url: &str) -> bool {
+    use std::ffi::c_void;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(hwnd: *mut c_void, op: *const u16, file: *const u16,
+                         params: *const u16, dir: *const u16, show: i32) -> isize;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+        fn CoUninitialize();
+    }
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (op, file) = (wide("open"), wide(url));
+    std::thread::spawn(move || unsafe {
+        let hr = CoInitializeEx(std::ptr::null_mut(), 0x2 | 0x4);   // apartment, no OLE1 DDE
+        let r = ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(),
+                              std::ptr::null(), std::ptr::null(), 1);
+        if hr >= 0 { CoUninitialize(); }
+        r > 32
+    }).join().unwrap_or(false)
+}
 
 /// A file another process holds for a moment: a sharing violation, or access
 /// denied, which is what replacing or deleting a file someone has open without
@@ -1555,6 +1740,40 @@ mod winproc {
         fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
         fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
         fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn QueryFullProcessImageNameW(process: Handle, flags: u32, name: *mut u16, size: *mut u32) -> i32;
+    }
+
+    /// The Claude desktop app's own executable, read off a running copy. The
+    /// Claude Code CLI is claude.exe too, so a name is not enough: the app is
+    /// `...\WindowsApps\Claude_<version>\app\Claude.exe` from the Store, or
+    /// `...\AnthropicClaude\app-<version>\claude.exe` from the direct installer.
+    pub fn claude_app_exe() -> Option<String> {
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap.is_null() || snap as isize == -1 { return None; }
+            let mut e: ProcessEntry32W = std::mem::zeroed();
+            e.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            let mut found = None;
+            let mut more = Process32FirstW(snap, &mut e) != 0;
+            while more && found.is_none() {
+                let len = e.exe_file.iter().position(|&c| c == 0).unwrap_or(MAX_PATH);
+                if String::from_utf16_lossy(&e.exe_file[..len]).eq_ignore_ascii_case("claude.exe") {
+                    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.pid);
+                    if !h.is_null() {
+                        let mut buf = [0u16; 1024];
+                        let mut n = buf.len() as u32;
+                        if QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut n) != 0 {
+                            let p = String::from_utf16_lossy(&buf[..n as usize]);
+                            if super::is_claude_app_exe(&p) { found = Some(p); }
+                        }
+                        CloseHandle(h);
+                    }
+                }
+                more = Process32NextW(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+            found
+        }
     }
 
     /// A process Ferry may not open - another user's, an elevated one - is
@@ -2981,6 +3200,15 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     let short = sid.trim_start_matches("local_").to_string();
     let dst_dir = format!("{}/{}/{}", sess_in(&dst.path), acct, org);
     fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
+    // With that account open in a running Claude, hand the chat to it through
+    // Claude's own door: it adopts the chat and shows it now, no restart.
+    // Claude writes the record itself, so Ferry writes none (two records for
+    // one conversation would list it twice the next time the app starts).
+    if let Some(wrote) = rec["cliSessionId"].as_str().and_then(|cli| hand_to_open_claude(&dst, &acct, cli)) {
+        if mv { move_out(&path, &short); }
+        return Ok(json!({ "ok": true, "wrote": wrote, "moved": mv, "live": true, "newId": false }));
+    }
+
     // the chat's own id, unless that account deleted it and its Claude is open
     let id = transfer_id(&dst, &dst_dir, &sid);
     let dst = format!("{}/{}.json", dst_dir, id);
@@ -2996,13 +3224,17 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     let tomb = format!("{}/deleted_{}", dst_dir, id.trim_start_matches("local_"));
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
 
-    if mv {
-        snapshot(&path, "moved-out");
-        let src_dir = Path::new(&path).parent().unwrap().to_string_lossy().to_string();
-        let _ = remove_record(&path);
-        let _ = fs::write(format!("{}/deleted_{}", src_dir, short), now_ms().to_string());
-    }
+    if mv { move_out(&path, &short); }
     Ok(json!({ "ok": true, "wrote": dst, "moved": mv, "newId": id != sid }))
+}
+
+/// The source half of a move: snapshot the record, take it out of the account
+/// it left, and leave the tombstone that lists it as deleted there.
+fn move_out(path: &str, short: &str) {
+    snapshot(path, "moved-out");
+    let src_dir = Path::new(path).parent().unwrap().to_string_lossy().to_string();
+    let _ = remove_record(path);
+    let _ = fs::write(format!("{}/deleted_{}", src_dir, short), now_ms().to_string());
 }
 
 /// A chat started without picking a folder runs in a workspace the app makes
@@ -3136,7 +3368,8 @@ fn import_session(path: String, acct: String, org: String, root: Option<String>)
             let out = import_session_at(&p, &acct, &org, &dst)?;
             // Cursor already named the conversation; keep its name over the
             // first line of the first prompt
-            if let Some(t) = chat["title"].as_str() {
+            // (not when Claude adopted it live: it holds that record in memory)
+            if let Some(t) = chat["title"].as_str().filter(|_| out["live"].as_bool() != Some(true)) {
                 if t != "(unnamed)" {
                     if let Some(w) = out["wrote"].as_str() {
                         if let Some(mut r) = read_json(w) {
@@ -3184,6 +3417,12 @@ fn import_session_at(path: &str, acct: &str, org: &str, dst: &Root) -> Result<Va
     // second, and a later copy to another account carries the same id, exactly
     // as a copy between two accounts does. Unless the account deleted it while
     // its Claude is open: then it comes in as a new chat (see transfer_id).
+    // With that account open in a running Claude, Claude adopts it itself and
+    // shows it now - under this same id, local_<transcript id>.
+    if let Some(wrote) = hand_to_open_claude(dst, acct, &sid) {
+        return Ok(json!({ "ok": true, "wrote": wrote, "id": format!("local_{}", sid), "live": true,
+                          "newId": false, "title": info["title"], "turns": info["turns"] }));
+    }
     let id = transfer_id(dst, &dst_dir, &format!("local_{}", sid));
     let mut rec = json!({
         "sessionId": id, "cliSessionId": sid,
