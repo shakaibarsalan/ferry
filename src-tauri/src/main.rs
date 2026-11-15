@@ -925,6 +925,67 @@ mod write_record_tests {
     }
 }
 
+/// A fork names its parent by id; these keep that link through a move.
+/// Platform-neutral: they run on the Windows and the macOS runner alike.
+#[cfg(test)]
+mod lineage_tests {
+    use serde_json::json;
+    use std::fs;
+
+    fn put(dir: &std::path::Path, rec: serde_json::Value) {
+        let id = rec["sessionId"].as_str().unwrap().to_string();
+        fs::write(dir.join(format!("{id}.json")), rec.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_fork_names_its_parent_in_any_of_claudes_three_fields() {
+        assert_eq!(super::parent_of(&json!({"forkedFromSessionId": "local_p"})).as_deref(), Some("local_p"));
+        assert_eq!(super::parent_of(&json!({"spawnedFrom": {"sessionId": "local_p"}})).as_deref(), Some("local_p"));
+        assert_eq!(super::parent_of(&json!({"dispatchParentId": "local_p"})).as_deref(), Some("local_p"));
+        assert_eq!(super::parent_of(&json!({"title": "no parent"})), None);
+        let mut r = json!({"forkedFromSessionId": "local_p", "spawnedFrom": {"sessionId": "local_p", "userFork": true}});
+        assert!(super::repoint_parent(&mut r, "local_p", "local_q"));
+        assert_eq!(r["forkedFromSessionId"], "local_q");
+        assert_eq!(r["spawnedFrom"]["sessionId"], "local_q");
+        assert_eq!(r["spawnedFrom"]["userFork"], true, "the rest of the link is kept");
+    }
+
+    #[test]
+    fn forks_come_with_their_parent_parents_first() {
+        let d = std::env::temp_dir().join(format!("ferry-forks-{}", super::now_ms()));
+        fs::create_dir_all(&d).unwrap();
+        put(&d, json!({"sessionId": "local_p", "cliSessionId": "p"}));
+        put(&d, json!({"sessionId": "local_c", "cliSessionId": "c", "forkedFromSessionId": "local_p"}));
+        put(&d, json!({"sessionId": "local_g", "cliSessionId": "g", "spawnedFrom": {"sessionId": "local_c"}}));
+        put(&d, json!({"sessionId": "local_x", "cliSessionId": "x"}));
+        let ids: Vec<String> = super::forks_of(&d.to_string_lossy(), "local_p").iter()
+            .map(|(_, r)| r["sessionId"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids, vec!["local_c", "local_g"], "child, then grandchild; an unrelated chat stays");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_fork_whose_parent_came_in_under_a_new_id_is_pointed_at_it() {
+        let d = std::env::temp_dir().join(format!("ferry-mend-{}", super::now_ms()));
+        fs::create_dir_all(&d).unwrap();
+        // the parent was adopted by Claude: local_<conversation id>, not its old id
+        put(&d, json!({"sessionId": "local_conv-p", "cliSessionId": "conv-p"}));
+        put(&d, json!({"sessionId": "local_c", "cliSessionId": "conv-c",
+                       "forkedFromSessionId": "local_old-p",
+                       "spawnedFrom": {"sessionId": "local_old-p", "sideSession": true}}));
+        let n = super::mend_lineage_with(&d.to_string_lossy(),
+            |id| (id == "local_old-p").then(|| "conv-p".to_string()));
+        assert_eq!(n, 1);
+        let c: serde_json::Value = serde_json::from_str(&fs::read_to_string(d.join("local_c.json")).unwrap()).unwrap();
+        assert_eq!(c["forkedFromSessionId"], "local_conv-p");
+        assert_eq!(c["spawnedFrom"]["sessionId"], "local_conv-p");
+        assert_eq!(c["spawnedFrom"]["sideSession"], true);
+        assert!(!d.join("local_c.json.ferrytmp").exists());
+        assert_eq!(super::mend_lineage_with(&d.to_string_lossy(), |_| None), 0, "nothing left to mend");
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
 /// Handing a chat to an open Claude through `claude://resume`. Nothing here
 /// launches anything: every case stops before the link is sent, and the
 /// runner has no Claude for one to reach anyway.
@@ -1052,17 +1113,18 @@ fn guard_in(root: &Root) -> Result<(), String> {
 }
 
 /// The guard for a transfer: a chat copied, moved or added into an account.
-/// On Windows that no longer waits for Claude. The record it writes is new to
-/// that account - Claude has never loaded it, so there is nothing in Claude's
-/// memory for it to clash with - and it is swapped in whole (`write_record`),
-/// so an open Claude never reads half of it. Claude lists it on its next reload
-/// or restart. Edits to a record Claude may already hold - rename, folder,
-/// delete, restore - keep `guard_in`: Claude keeps those in memory and writes
-/// its own copy back over them. Elsewhere a transfer waits for Claude to quit,
-/// as every write always has.
-#[cfg(target_os = "windows")]
+/// On Windows and macOS that no longer waits for Claude. The record it writes
+/// is new to that account - Claude has never loaded it, so there is nothing in
+/// Claude's memory for it to clash with - and it is swapped in whole
+/// (`write_record`), so an open Claude never reads half of it; when that
+/// account is open in a running Claude, the chat is handed to it instead
+/// (`hand_to_open_claude`). Edits to a record Claude may already hold - rename,
+/// folder, delete, restore - keep `guard_in`: Claude keeps those in memory and
+/// writes its own copy back over them. Anywhere else a transfer waits for
+/// Claude to quit, as every write always has.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn guard_transfer(_root: &Root) -> Result<(), String> { Ok(()) }
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn guard_transfer(root: &Root) -> Result<(), String> { guard_in(root) }
 
 /// The id a transfer writes a chat under in `dir`, an account's folder. A chat
@@ -1072,9 +1134,9 @@ fn guard_transfer(root: &Root) -> Result<(), String> { guard_in(root) }
 /// deleted one stays deleted - the rule Nearby's receive follows. The new id is
 /// derived, not random, so a retried move lands on the same record instead of
 /// making another. With Claude quit it is the chat's own id, and writing it
-/// clears the tombstone: a plain restore, as before. Only Windows gets here
-/// with Claude open; elsewhere `guard_transfer` has already waited for a quit.
-#[cfg(target_os = "windows")]
+/// clears the tombstone: a plain restore, as before. Only Windows and macOS get
+/// here with Claude open; elsewhere `guard_transfer` has already waited.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn transfer_id(root: &Root, dir: &str, sid: &str) -> String {
     let tomb = |id: &str| Path::new(&format!("{}/deleted_{}", dir, id.trim_start_matches("local_"))).exists();
     let live = |id: &str| Path::new(&format!("{}/{}.json", dir, id)).exists();
@@ -1092,7 +1154,7 @@ fn transfer_id(root: &Root, dir: &str, sid: &str) -> String {
     }
     sid.to_string()
 }
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn transfer_id(_root: &Root, _dir: &str, sid: &str) -> String { sid.to_string() }
 
 /// Hand a chat to the Claude window that has `root` open, through the door
@@ -1106,7 +1168,7 @@ fn transfer_id(_root: &Root, _dir: &str, sid: &str) -> String { sid.to_string() 
 /// Claude writes the record itself, and this waits for it. None means nothing
 /// was handed over, and the caller writes the record as before, for Claude to
 /// read the next time it opens that account.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn hand_to_open_claude(root: &Root, acct: &str, cli: &str) -> Option<String> {
     if !is_uuid(cli) || !app_running_in(&root.path) { return None; }
     let signed_in = read_json(&cfg_in(&root.path))
@@ -1120,20 +1182,7 @@ fn hand_to_open_claude(root: &Root, acct: &str, cli: &str) -> Option<String> {
     if glob::glob(&tomb).map(|mut g| g.next().is_some()).unwrap_or(false) { return None; }
     let had = record_in(&acct_dir, &id);
     let url = format!("claude://resume?session={}", cli);
-    let sent = if root.builtin {
-        // Claude's own folder: the app's registered link handler reaches the
-        // window started from the Start menu, with the app's own identity
-        shell_open(&url)
-    } else {
-        // a folder added under Locations is a window started with
-        // --user-data-dir; the same switch hands the link to that window, and
-        // the copy started here exits once it has
-        let dir = root.path.replace('/', "\\");
-        cursor::winproc::claude_app_exe().map(|exe| Command::new(exe)
-            .arg(format!("--user-data-dir={}", dir.trim_end_matches('\\')))
-            .arg(&url).spawn().is_ok()).unwrap_or(false)
-    };
-    if !sent { return None; }
+    if !send_resume(root, &url) { return None; }
     if let Some((p, _)) = had {
         // already in that account: Claude just brings it up
         std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -1141,11 +1190,36 @@ fn hand_to_open_claude(root: &Root, acct: &str, cli: &str) -> Option<String> {
     }
     wait_for_record(&acct_dir, &id, std::time::Duration::from_secs(8))
 }
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn hand_to_open_claude(_root: &Root, _acct: &str, _cli: &str) -> Option<String> { None }
 
-/// What `claude://resume` accepts: Claude checks for exactly this uuid shape.
+/// Deliver the link to the window that has `root` open.
 #[cfg(target_os = "windows")]
+fn send_resume(root: &Root, url: &str) -> bool {
+    if root.builtin {
+        // Claude's own folder: the app's registered link handler reaches the
+        // window started from the Start menu, with the app's own identity
+        shell_open(url)
+    } else {
+        // a folder added under Locations is a window started with
+        // --user-data-dir; the same switch hands the link to that window, and
+        // the copy started here exits once it has
+        let dir = root.path.replace('/', "\\");
+        cursor::winproc::claude_app_exe().map(|exe| Command::new(exe)
+            .arg(format!("--user-data-dir={}", dir.trim_end_matches('\\')))
+            .arg(url).spawn().is_ok()).unwrap_or(false)
+    }
+}
+/// On a Mac `open` hands the link to the running Claude.app, which takes it in
+/// the window for Claude's own folder. A copy started with --user-data-dir is
+/// not one a link can be aimed at there, so those keep the written record.
+#[cfg(target_os = "macos")]
+fn send_resume(root: &Root, url: &str) -> bool {
+    root.builtin && Command::new("open").arg(url).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// What `claude://resume` accepts: Claude checks for exactly this uuid shape.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.char_indices()
         .all(|(i, c)| if [8, 13, 18, 23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() })
@@ -1160,7 +1234,7 @@ fn is_claude_app_exe(p: &str) -> bool {
 }
 
 /// A record named `id` in any of this account's organisation folders.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn record_in(acct_dir: &str, id: &str) -> Option<(String, SystemTime)> {
     let g = format!("{}/*/{}.json", glob::Pattern::escape(acct_dir), id);
     glob::glob(&g).ok()?.flatten()
@@ -1170,7 +1244,7 @@ fn record_in(acct_dir: &str, id: &str) -> Option<(String, SystemTime)> {
 }
 
 /// Wait for Claude to write the record it adopts a chat under.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn wait_for_record(acct_dir: &str, id: &str, within: std::time::Duration) -> Option<String> {
     let until = std::time::Instant::now() + within;
     loop {
@@ -1216,9 +1290,7 @@ fn held_briefly(e: &std::io::Error) -> bool { matches!(e.raw_os_error(), Some(32
 /// Write a record so an open Claude never sees half of it. The bytes go to a
 /// sibling first - named so Claude's `local_*.json` scan skips it - and are
 /// swapped in with one same-directory rename (replace-existing), retried
-/// briefly while Claude happens to be reading the old file. Elsewhere a write
-/// waits for Claude to quit, so a plain write has always been safe and that is
-/// all this is.
+/// briefly while Claude happens to be reading the old file.
 #[cfg(target_os = "windows")]
 fn write_record(dst: &str, bytes: &str) -> Result<(), String> {
     let tmp = format!("{}.ferrytmp", dst);
@@ -1238,9 +1310,14 @@ fn write_record(dst: &str, bytes: &str) -> Result<(), String> {
         }
     }
 }
+/// Elsewhere a rename over the old file is atomic and nothing holds it, so the
+/// same sibling-then-swap needs no retry: an open Claude still never reads half
+/// a record.
 #[cfg(not(target_os = "windows"))]
 fn write_record(dst: &str, bytes: &str) -> Result<(), String> {
-    fs::write(dst, bytes).map_err(|e| e.to_string())
+    let tmp = format!("{}.ferrytmp", dst);
+    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, dst).map_err(|e| { let _ = fs::remove_file(&tmp); e.to_string() })
 }
 
 /// Take a moved chat's record out of the account it left, retried the same way
@@ -3197,35 +3274,151 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     guard_transfer(&dst)?;
     let rec = read_json(&path).ok_or("source unreadable")?;
     let sid = rec["sessionId"].as_str().ok_or("no sessionId")?.to_string();
-    let short = sid.trim_start_matches("local_").to_string();
     let dst_dir = format!("{}/{}/{}", sess_in(&dst.path), acct, org);
     fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
-    // With that account open in a running Claude, hand the chat to it through
-    // Claude's own door: it adopts the chat and shows it now, no restart.
-    // Claude writes the record itself, so Ferry writes none (two records for
-    // one conversation would list it twice the next time the app starts).
-    if let Some(wrote) = rec["cliSessionId"].as_str().and_then(|cli| hand_to_open_claude(&dst, &acct, cli)) {
-        if mv { move_out(&path, &short); }
-        return Ok(json!({ "ok": true, "wrote": wrote, "moved": mv, "live": true, "newId": false }));
+    // Its forks in that account go with it, parents first: a fork left behind,
+    // or one that arrives before its parent's new id is known, has no parent.
+    let src_dir = Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let forks = if same_dir(&src_dir, &dst_dir) { vec![] } else { forks_of(&src_dir, &sid) };
+    let first = transfer_one(&path, &rec, &dst, &acct, &dst_dir, mv)?;
+    let carried = forks.iter()
+        .map(|(p, r)| transfer_one(p, r, &dst, &acct, &dst_dir, mv))
+        .filter(|landed| landed.is_ok()).count();
+    // every fork in that account now finds its parent by its id there
+    let relinked = mend_lineage(&dst_dir);
+    Ok(json!({ "ok": true, "wrote": first.wrote, "moved": mv, "live": first.live, "newId": first.new_id,
+               "forks": carried, "relinked": relinked }))
+}
+
+struct Landed { wrote: String, live: bool, new_id: bool }
+
+/// One chat into one account. With that account open in a running Claude, it
+/// is handed to Claude through its own door (hand_to_open_claude): Claude
+/// adopts it and shows it now, and writes the record itself, so Ferry writes
+/// none (two records for one conversation would list it twice). A fork is
+/// always written instead: Claude's adopt keeps no link to a parent, and the
+/// written record does - it shows when that window next starts.
+fn transfer_one(path: &str, rec: &Value, dst: &Root, acct: &str, dst_dir: &str, mv: bool)
+    -> Result<Landed, String>
+{
+    let sid = rec["sessionId"].as_str().ok_or("no sessionId")?.to_string();
+    let short = sid.trim_start_matches("local_").to_string();
+    if parent_of(rec).is_none() {
+        if let Some(wrote) = rec["cliSessionId"].as_str().and_then(|cli| hand_to_open_claude(dst, acct, cli)) {
+            if mv { move_out(path, &short); }
+            return Ok(Landed { wrote, live: true, new_id: false });
+        }
     }
 
     // the chat's own id, unless that account deleted it and its Claude is open
-    let id = transfer_id(&dst, &dst_dir, &sid);
-    let dst = format!("{}/{}.json", dst_dir, id);
-
+    let id = transfer_id(dst, dst_dir, &sid);
+    let to = format!("{}/{}.json", dst_dir, id);
     let mut out = rec.clone();
     if let Some(o) = out.as_object_mut() { for k in ACCOUNT_SCOPED { o.remove(k); } }
     if id != sid { out["sessionId"] = json!(id); }
-    snapshot(&dst, "overwrite");
-    write_record(&dst, &serde_json::to_string_pretty(&out).unwrap())?;
+    snapshot(&to, "overwrite");
+    write_record(&to, &serde_json::to_string_pretty(&out).unwrap())?;
 
     // a tombstone under the id just written is a restore; one under the old id,
     // when the chat came in under a new one, stays - Claude holds it as deleted
     let tomb = format!("{}/deleted_{}", dst_dir, id.trim_start_matches("local_"));
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
 
-    if mv { move_out(&path, &short); }
-    Ok(json!({ "ok": true, "wrote": dst, "moved": mv, "newId": id != sid }))
+    if mv { move_out(path, &short); }
+    Ok(Landed { wrote: to, live: false, new_id: id != sid })
+}
+
+/// A fork names its parent by the parent's session id, in any of these, and
+/// Claude finds the parent only by looking that id up in the same account. So
+/// when a parent lands somewhere under another id - Claude's own adopt always
+/// names it local_<conversation id> - its forks lose it unless they are told.
+fn parent_of(rec: &Value) -> Option<String> {
+    rec["forkedFromSessionId"].as_str()
+        .or_else(|| rec["spawnedFrom"]["sessionId"].as_str())
+        .or_else(|| rec["dispatchParentId"].as_str())
+        .filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// Point every reference a fork makes to `old` at `new` instead.
+fn repoint_parent(rec: &mut Value, old: &str, new: &str) -> bool {
+    let mut changed = false;
+    for k in ["forkedFromSessionId", "dispatchParentId"] {
+        if rec[k].as_str() == Some(old) { rec[k] = json!(new); changed = true; }
+    }
+    if rec["spawnedFrom"]["sessionId"].as_str() == Some(old) {
+        rec["spawnedFrom"]["sessionId"] = json!(new);
+        changed = true;
+    }
+    changed
+}
+
+/// The records in one account-and-organisation folder.
+fn records_in(dir: &str) -> Vec<(String, Value)> {
+    let Ok(rd) = fs::read_dir(dir) else { return vec![] };
+    rd.flatten().filter_map(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        if !(n.starts_with("local_") && n.ends_with(".json")) { return None; }
+        let p = e.path().to_string_lossy().to_string();
+        read_json(&p).map(|v| (p, v))
+    }).collect()
+}
+
+/// The forks made from `sid` in `dir`, and theirs: parents before children, so
+/// each can be pointed at its parent once that has landed.
+fn forks_of(dir: &str, sid: &str) -> Vec<(String, Value)> {
+    let all = records_in(dir);
+    let (mut out, mut parents, mut i) = (vec![], vec![sid.to_string()], 0);
+    while i < parents.len() {
+        let p = parents[i].clone();
+        i += 1;
+        for (path, rec) in &all {
+            let Some(id) = rec["sessionId"].as_str() else { continue };
+            if parents.iter().any(|s| s == id) { continue; }
+            if parent_of(rec).as_deref() == Some(p.as_str()) {
+                parents.push(id.to_string());
+                out.push((path.clone(), rec.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The conversation a session id belonged to, wherever that record is now: in
+/// any folder Ferry reads, or in the snapshot Ferry took when it moved it out.
+fn conversation_of(id: &str) -> Option<String> {
+    let cli_in = |p: &PathBuf| read_json(&p.to_string_lossy()).and_then(|v| v["cliSessionId"].as_str().map(String::from));
+    for r in roots() {
+        let g = format!("{}/*/*/{}.json", glob::Pattern::escape(&sess_in(&r.path)), glob::Pattern::escape(id));
+        if let Some(c) = glob::glob(&g).ok().and_then(|g| g.flatten().find_map(|p| cli_in(&p))) { return Some(c); }
+    }
+    let g = format!("{}/snapshots/*-{}.json", glob::Pattern::escape(&vault()), glob::Pattern::escape(id));
+    let mut snaps: Vec<PathBuf> = glob::glob(&g).ok()?.flatten().collect();
+    snaps.sort();   // stamped names: the newest last
+    snaps.iter().rev().find_map(cli_in)
+}
+
+/// Mend the links in one account folder after chats have landed in it: a fork
+/// whose parent id is not there is pointed at the record of the same
+/// conversation that is, which is where its parent went. How many it mended.
+fn mend_lineage(dir: &str) -> usize { mend_lineage_with(dir, conversation_of) }
+
+fn mend_lineage_with(dir: &str, conversation: impl Fn(&str) -> Option<String>) -> usize {
+    let recs = records_in(dir);
+    let ids: Vec<&str> = recs.iter().filter_map(|(_, r)| r["sessionId"].as_str()).collect();
+    let mut mended = 0;
+    for (path, rec) in &recs {
+        let Some(old) = parent_of(rec) else { continue };
+        if ids.contains(&old.as_str()) { continue; }
+        let Some(conv) = conversation(&old) else { continue };
+        let Some(new) = recs.iter().find(|(_, r)| r["cliSessionId"].as_str() == Some(conv.as_str()))
+            .and_then(|(_, r)| r["sessionId"].as_str()) else { continue };
+        let mut fixed = rec.clone();
+        if repoint_parent(&mut fixed, &old, new) {
+            snapshot(path, "relink");
+            if write_record(path, &serde_json::to_string_pretty(&fixed).unwrap()).is_ok() { mended += 1; }
+        }
+    }
+    mended
 }
 
 /// The source half of a move: snapshot the record, take it out of the account

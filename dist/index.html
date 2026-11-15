@@ -46,7 +46,7 @@ input,select{font:inherit;color:inherit}
 .btn:disabled{opacity:.55;cursor:default}
 /* Title-bar marks: Claude and Cursor always sit here. A corner dot is the
    running state (green open, red quit). Writes stay blocked while open,
-   except copying, moving or adding a chat into Claude on Windows (reloadHint).
+   except copying, moving or adding a chat into Claude on Windows and macOS (LIVE).
    Not the account-row .dotc, which is signed-in.
    Claude is the official spark (Claude.app AppLogo path, .av.lg-claude), not a C. */
 #lock{display:inline-flex;align-items:center;gap:8px}
@@ -368,13 +368,13 @@ const WIN=/Windows/.test(navigator.userAgent);   // genuinely platform-specific 
 const RICH=true;                                 // the loading / confirm / mascot UI: on everywhere
 const MAC=/Mac/.test(navigator.platform||navigator.userAgent);
 const MODK=e=>MAC?e.metaKey:e.ctrlKey;           // Cmd on a Mac, Ctrl elsewhere
-// On Windows a transfer now goes through while Claude is open (the record is
-// swapped in safely), and Claude lists the chat on its next read - instead of
-// the old "quit Claude first". So the only thing left to say is to make Claude
-// read again: a restart shows it for certain, and a reload may too. Appended to
-// the success line only when Claude is actually open; on macOS the write still
-// waits for a quit, so there is nothing to append.
-const reloadHint=on=>(WIN&&on&&S&&S.appRunning)?" · reload or restart Claude to see it":"";
+// On Windows and macOS a transfer goes through while Claude is open (LIVE):
+// handed to the open window when that account is signed in there, else written
+// for Claude to list the next time it opens that account. The hint is for the
+// second case, appended only when Claude is actually open. Elsewhere a write
+// still waits for a quit, so there is nothing to append.
+const LIVE=WIN||MAC;
+const reloadHint=on=>(LIVE&&on&&S&&S.appRunning)?" · Claude shows it the next time it opens that account":"";
 const MARK=`<svg class=mk viewBox="0 0 100 100" aria-hidden=true>\n <defs><mask id="gap">\n <rect width="100" height="100" fill="#fff"/>\n <rect x="57.4" y="38.9" width="18.6" height="11.8" fill="#000"/>\n </mask></defs>\n <path mask="url(#gap)" fill="currentColor" fill-rule="evenodd"\n d="M33 26.9h24.6a11.2 11.2 0 0 1 11.2 11.2v14.8a11.2 11.2 0 0 1-11.2 11.2H33\n A11.2 11.2 0 0 1 21.8 52.9V38.1A11.2 11.2 0 0 1 33 26.9Z\n M33.9 32.9h22.8a6 6 0 0 1 6 6v13.2a6 6 0 0 1-6 6H33.9a6 6 0 0 1-6-6V38.9a6 6 0 0 1 6-6Z"/>\n <path mask="url(#gap)" fill="currentColor" d="M31.2 63.4h14.1l-15 13.4Z"/>\n <rect x="42.5" y="42" width="33.5" height="5.6" rx="2.8" fill="#d97757"/>\n <path fill="#d97757" d="M81.2 44.8 70.8 37.9v13.8Z"/>\n </svg>`;
 let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0;
 
@@ -508,7 +508,9 @@ async function transfer(path,t,mv){
     toast(res&&res.noWorkspace
       ? "Written, but no Cursor workspace matched that folder, so it is in no chat list"
       : ok+(res&&res.newId?" as a new chat":"")+                       // see transfer_id
-        (res&&res.live?" · open in Claude now":reloadHint(!toCur)));   // see hand_to_open_claude
+        (res&&res.forks?" with its "+res.forks+" fork"+(res.forks>1?"s":""):"")+   // see forks_of
+        (res&&res.live?" · open in Claude now"+(res.forks?"; forks show when that window next starts":"")
+                      :reloadHint(!toCur)));                            // see hand_to_open_claude
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
@@ -766,10 +768,11 @@ function ask(p,t,mv){
      :mv?'<p>It moves to '+to+' and leaves '+from+', where you can restore it from the deleted list.</p>'
      :'<p>It is added to '+to+' and stays in '+from+'.</p>')+
     (toCur&&S.cursorRunning?'<p class=warn>Cursor is open, so Ferry can\'t write yet. Quit Cursor, then confirm.</p>':'')+
-    (!toCur&&S.appRunning?(WIN
+    (!toCur&&S.appRunning?(LIVE
       ?'<p class=nbnote>Claude is open, and that is fine: if '+to+' is the account signed in there, Ferry hands the chat to Claude and it opens straight away. '+
-        'Otherwise Claude shows it the next time it opens '+to+
-        (mv===false||imp?'.':'; until then don\'t open it in '+from+', or Claude may keep a copy there.')+'</p>'
+        'Otherwise Claude shows it the next time it opens '+to+'.'+
+        (mv===false||imp?'':' A window that has '+from+' open keeps listing it until it next starts: '+
+          'don\'t open or delete it there, or Claude may keep a copy, or delete the conversation the moved chat uses.')+'</p>'
       :'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>'):'')+
     '<div class=askb>'+btn("an","Cancel")+
       (toCur?btn("ago","Convert",1)
@@ -843,9 +846,9 @@ const unesc=s=>String(s).replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quo
 /* ---------- data ---------- */
 function appMark(name,running,mark){
   const open=!!running;
-  // on Windows a chat copied, moved or added into Claude goes through while
-  // Claude is open (reloadHint); edits, Cursor, and macOS still wait for a quit
-  const waits=!(WIN&&name==="Claude");
+  // on Windows and macOS a chat copied, moved or added into Claude goes
+  // through while Claude is open (LIVE); edits and Cursor still wait for a quit
+  const waits=!(LIVE&&name==="Claude");
   const tip=name+" is "+(open?"open":"quit")+" · "+
     (!open?"writes on":waits?"writes off":"copies and moves go through; rename, delete and restore wait");
   return '<span class="appst '+(open?"on":"off")+'" title="'+esc(tip)+'">'+mark+'<i aria-hidden=true></i></span>';

@@ -1,0 +1,48 @@
+name: macOS build
+
+# Tests Ferry on a Mac runner and builds the universal (arm64 + x86_64)
+# Ferry.app with build.sh, ad-hoc signed, uploaded as a workflow artifact.
+# Nothing is tagged, released or published: the artifact is for testing.
+# Not notarized, so a downloaded copy needs right-click > Open the first time.
+on:
+  workflow_dispatch:
+  # a dispatch needs the file on the default branch; a push runs it from here
+  push:
+    branches: [windows-transfer-while-claude-open]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          rustc --version
+          cargo --version
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Ferry.app (universal, ad-hoc signed)
+        run: ./build.sh "$RUNNER_TEMP/Ferry.app"
+
+      - name: Zip
+        # ditto keeps the bundle and its signature intact, as build.sh --zip does
+        run: |
+          cd "$RUNNER_TEMP"
+          ditto -c -k --norsrc --noextattr --keepParent Ferry.app Ferry-macos-universal.zip
+          ls -l Ferry-macos-universal.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ferry-macos-universal
+          path: ${{ runner.temp }}/Ferry-macos-universal.zip
