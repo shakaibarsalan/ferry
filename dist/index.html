@@ -1154,7 +1154,26 @@ async function doExport(){
   catch(e){ toast(String(e),true); }
 }
 const doRename=()=>op("rename_chat",{path:chatPath,title:$("#ttl").value},"Renamed","Renaming…");
-const doDelete=()=>op("delete_chat",{path:chatPath},"Deleted");
+// Windows asks in Ferry's own card, like every other write, and tells the Rust
+// side it has; a native message box looked foreign here. macOS keeps its
+// native sheet, which already belongs to the window.
+function askDelete(){
+  const p=chatPath,[s,c]=chatAt(p);if(!s||!c)return;
+  const a=$("#ask");
+  a.innerHTML='<div class=askc role=dialog aria-modal=true aria-labelledby=askh>'+
+    '<h3 id=askh>Delete this chat?</h3>'+
+    '<div class=ct>'+esc(c.title)+'</div>'+
+    '<p>It is removed from '+esc(short(s))+'. The conversation itself stays on disk and in your archive, '+
+      'so you can restore it from the deleted list.</p>'+
+    (S.appRunning?'<p class=nbnote>If Claude has this account open, quit it first: an open Claude would put the chat back.</p>':'')+
+    '<div class=askb><button class=btn id=an>Cancel</button><button class="btn p" id=ago>Delete</button></div></div>';
+  a.className="on";
+  $("#an").onclick=closeAsk;
+  a.onclick=e=>{if(e.target===a)closeAsk();};                  // a click outside the card cancels
+  $("#ago").onclick=()=>{closeAsk();op("delete_chat",{path:p,confirmed:true},"Deleted");};
+  $("#ago").focus();                                           // Enter deletes, Esc cancels
+}
+const doDelete=()=>WIN?askDelete():op("delete_chat",{path:chatPath},"Deleted");
 function btnSend(mv){const t=S.scopes.find(x=>key(x)===(RICH?tgtKey:$("#tgt").value));
   if(mv==="toCursor"||isCur(t))return RICH?ask(chatPath,t,"toCursor"):send(chatPath,t,"toCursor");
   RICH?ask(chatPath,t,mv):send(chatPath,t,mv);}

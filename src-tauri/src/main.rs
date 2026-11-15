@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+// Windows starts no child process any more (winproc asks kernel32 instead)
+#[cfg_attr(windows, allow(unused_imports))]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1490,24 +1492,106 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let out = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
-        Err(_) => false,
+fn pid_alive(pid: u32) -> bool { winproc::alive(pid) }
+
+/// Ask Windows directly whether a process is up, instead of running tasklist.
+/// Every scan used to start a hidden tasklist.exe, and a scan follows every
+/// write - so a run of deletes and moves was an unsigned app starting
+/// windowless console tools while it removed files in another app's folder,
+/// which is the shape behaviour-based antivirus flags: Defender quarantined
+/// Ferry mid-way through such a run ("Behavior:Win32/DefenseEvasion.A!ml").
+/// kernel32 answers the same two questions in-process, with no child at all.
+#[cfg(windows)]
+mod winproc {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const TH32CS_SNAPPROCESS: u32 = 0x2;
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32, usage: u32, pid: u32, heap_id: usize, module_id: u32,
+        threads: u32, parent_pid: u32, pri_class_base: i32, flags: u32,
+        exe_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    }
+
+    /// A process Ferry may not open - another user's, an elevated one - is
+    /// still a process that is running, so access denied counts as alive.
+    pub fn alive(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            ok && code == STILL_ACTIVE
+        }
+    }
+
+    /// Whether any process runs this image, matched the way tasklist's
+    /// IMAGENAME filter matched it: the file name, ignoring case.
+    pub fn image_running(name: &str) -> bool {
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap.is_null() || snap as isize == -1 { return false; }
+            let mut e: ProcessEntry32W = std::mem::zeroed();
+            e.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            let mut found = false;
+            let mut more = Process32FirstW(snap, &mut e) != 0;
+            while more {
+                let len = e.exe_file.iter().position(|&c| c == 0).unwrap_or(MAX_PATH);
+                if String::from_utf16_lossy(&e.exe_file[..len]).eq_ignore_ascii_case(name) {
+                    found = true;
+                    break;
+                }
+                more = Process32NextW(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+            found
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod winproc_tests {
+    #[test]
+    fn this_process_is_alive_and_an_impossible_pid_is_not() {
+        assert!(super::winproc::alive(std::process::id()));
+        // Windows pids are multiples of four; an odd one is never a process
+        assert!(!super::winproc::alive(0xFFFF_FFF1));
+    }
+
+    #[test]
+    fn finds_its_own_image_by_name_in_any_case_and_not_a_made_up_one() {
+        let me = std::env::current_exe().unwrap();
+        let name = me.file_name().unwrap().to_string_lossy().to_string();
+        assert!(super::winproc::image_running(&name), "the test binary itself: {name}");
+        assert!(super::winproc::image_running(&name.to_uppercase()), "case does not matter");
+        assert!(!super::winproc::image_running("no-such-image-ferry-test.exe"));
     }
 }
 
 #[cfg(not(any(unix, windows)))]
 fn pid_alive(_pid: u32) -> bool { false }
 
-/// True if the Cursor app is up. code.lock holds the main pid; pgrep /
-/// tasklist is the fallback when the lock file was left behind. SQLite
+/// True if the Cursor app is up. code.lock holds the main pid; pgrep, or a
+/// process snapshot on Windows, is the fallback when the lock file was left
+/// behind. SQLite
 /// opening read-write is not a signal - that succeeds while Cursor is running.
 pub fn cursor_running() -> bool {
     let lock = format!("{}/code.lock", cursor_app_dir());
@@ -1527,13 +1611,7 @@ pub fn cursor_running() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let out = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq Cursor.exe"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        return out.map(|o| String::from_utf8_lossy(&o.stdout).contains("Cursor.exe")).unwrap_or(false);
+        return winproc::image_running("Cursor.exe");
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     { false }
@@ -3111,17 +3189,20 @@ fn rename_chat(path: String, title: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn delete_chat(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+async fn delete_chat(app: tauri::AppHandle, path: String, confirmed: Option<bool>) -> Result<Value, String> {
     guard_in(&root_of(&path)?)?;
     let rec = read_json(&path).ok_or("chat unreadable")?;
 
-    {
+    // The Windows page asks in its own card first, the same card every other
+    // write uses, and says so here; a native message box looked foreign next
+    // to them. macOS sends nothing and keeps its native sheet.
+    if confirmed != Some(true) {
         use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
         let title = rec["title"].as_str().unwrap_or("this chat");
         let (tx, rx) = std::sync::mpsc::channel();
         app.dialog()
             .message(format!(
-                "Remove \u{201c}{}\u{201d} from this account?\n\n                 The conversation itself stays on disk and in your archive,                  so you can restore it later.", title))
+                "Remove \u{201c}{}\u{201d} from this account?\n\nThe conversation itself stays on disk and in your archive, so you can restore it later.", title))
             .title("Delete chat")
             .kind(MessageDialogKind::Warning)
             .buttons(MessageDialogButtons::OkCancelCustom("Delete".into(), "Cancel".into()))
