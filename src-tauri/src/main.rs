@@ -1005,6 +1005,54 @@ mod lineage_tests {
     }
 }
 
+/// A chat a running Claude wrote back after a move is told apart from a copy.
+/// Platform-neutral, like the lineage tests.
+#[cfg(test)]
+mod moved_tests {
+    use serde_json::json;
+
+    fn scopes(v: serde_json::Value) -> std::collections::BTreeMap<String, serde_json::Value> {
+        v.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    #[test]
+    fn a_written_back_chat_points_where_it_went_and_leaves_the_deleted_list() {
+        let mut s = scopes(json!({
+            "r|fund|o": { "chats": [
+                {"id": "local_a", "conv": "c1"},
+                {"id": "local_b", "conv": "c2"},
+                {"id": "local_c", "conv": "c3"}
+            ], "deleted": [{"id": "local_a"}, {"id": "local_c"}, {"id": "local_z"}] },
+            "r2|xai|o": { "chats": [
+                {"id": "local_a2", "conv": "c1", "archived": true},
+                {"id": "local_b", "conv": "c2"}
+            ], "deleted": [] },
+            "r3|oth|o": { "chats": [ {"id": "local_a3", "conv": "c1"} ], "deleted": [] }
+        }));
+        super::mark_moved(&mut s);
+        let f = &s["r|fund|o"];
+        assert_eq!(f["chats"][0]["movedTo"], "r3|oth|o", "the copy that is not archived wins");
+        assert!(f["chats"][1]["movedTo"].is_null(), "a copy without a tombstone is not a leftover");
+        assert!(f["chats"][2]["movedTo"].is_null(), "deleted and written back, but it went nowhere");
+        let dead: Vec<&str> = f["deleted"].as_array().unwrap().iter()
+            .map(|d| d["id"].as_str().unwrap()).collect();
+        assert_eq!(dead, ["local_c", "local_z"], "only the leftover's tombstone leaves the list");
+        assert!(s["r2|xai|o"]["chats"][0]["movedTo"].is_null());
+        assert!(s["r3|oth|o"]["chats"][0]["movedTo"].is_null());
+    }
+
+    #[test]
+    fn an_archived_copy_counts_when_it_is_the_only_one() {
+        let mut s = scopes(json!({
+            "a|x|o": { "chats": [ {"id": "local_a", "conv": "c1"} ], "deleted": [{"id": "local_a"}] },
+            "b|y|o": { "chats": [ {"id": "local_q", "conv": "c1", "archived": true} ], "deleted": [] }
+        }));
+        super::mark_moved(&mut s);
+        assert_eq!(s["a|x|o"]["chats"][0]["movedTo"], "b|y|o");
+        assert!(s["a|x|o"]["deleted"].as_array().unwrap().is_empty());
+    }
+}
+
 /// Handing a chat to an open Claude through `claude://resume`. Nothing here
 /// launches anything: every case stops before the link is sent, and the
 /// runner has no Claude for one to reach anyway.
@@ -2987,7 +3035,7 @@ fn scan() -> Value {
                 "cwd": rec["cwd"], "model": rec["model"],
                 "created": rec["createdAt"], "last": rec["lastActivityAt"],
                 "turns": rec["completedTurns"], "archived": rec["isArchived"],
-                "forkedFrom": rec["forkedFromSessionId"],
+                "forkedFrom": rec["forkedFromSessionId"], "conv": rec["cliSessionId"],
                 "files": tr.len(), "subs": subs, "bytes": bytes,
                 "missing": missing, "absent": absent,
                 "path": p.to_string_lossy()
@@ -3020,6 +3068,7 @@ fn scan() -> Value {
                               "path": p.to_string_lossy() }));
         }
     }
+    mark_moved(&mut scopes);
     // A deleted chat is named by its title where one survives: in the account a
     // move took it to, else in the newest archived copy, which Restore would use.
     let titles: std::collections::HashMap<String, String> = scopes.values()
@@ -3064,6 +3113,44 @@ fn scan() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "paths": { "sessions": sess(), "projects": proj(), "home": home() },
             "diag": diagnostics() })
+}
+
+/// Find the chats a running Claude wrote back after Ferry moved them out. A
+/// window that had the chat open keeps it in memory and saves its record again,
+/// so the record ends up beside its own tombstone while the same conversation
+/// lives on in another account. Such a chat gets `movedTo`, the key of the
+/// account it went to (one where it is not archived, if there is one), and its
+/// tombstone leaves the deleted list: there is nothing there to restore.
+fn mark_moved(scopes: &mut std::collections::BTreeMap<String, Value>) {
+    let tombs = |s: &Value| -> std::collections::HashSet<String> {
+        s["deleted"].as_array().map(|d| d.iter()
+            .filter_map(|x| x["id"].as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    // conversation -> (account key, archived) for every chat that is not itself
+    // a leftover
+    let mut homes: std::collections::HashMap<String, Vec<(String, bool)>> = Default::default();
+    let mut left: Vec<(String, String)> = vec![];
+    for (k, s) in scopes.iter() {
+        let t = tombs(s);
+        for c in s["chats"].as_array().into_iter().flatten() {
+            let (Some(id), Some(conv)) = (c["id"].as_str(), c["conv"].as_str()) else { continue };
+            if t.contains(id) { left.push((k.clone(), id.to_string())); continue; }
+            homes.entry(conv.to_string()).or_default()
+                .push((k.clone(), c["archived"].as_bool().unwrap_or(false)));
+        }
+    }
+    for (k, id) in left {
+        let s = scopes.get_mut(&k).unwrap();
+        if let Some(c) = s["chats"].as_array_mut().unwrap().iter_mut()
+            .find(|c| c["id"].as_str() == Some(id.as_str())) {
+            let there = c["conv"].as_str().and_then(|v| homes.get(v)).and_then(|h| {
+                let away: Vec<&(String, bool)> = h.iter().filter(|(hk, _)| *hk != k).collect();
+                away.iter().find(|(_, a)| !*a).or(away.first()).map(|(hk, _)| hk.clone())
+            });
+            if let Some(to) = there { c["movedTo"] = json!(to); } else { continue; }
+        }
+        s["deleted"].as_array_mut().unwrap().retain(|d| d["id"].as_str() != Some(id.as_str()));
+    }
 }
 
 /// Walk every transcript that belongs to one chat, oldest session first.

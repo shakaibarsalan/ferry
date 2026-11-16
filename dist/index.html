@@ -129,6 +129,11 @@ main{display:grid;grid-template-columns:236px 296px minmax(0,1fr);height:calc(10
 .ch .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
 .ch .n{color:var(--faint);font-size:10px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .ch.dead .t{text-decoration:line-through;color:var(--faint)}
+.ch.arch .t{color:var(--dim)}
+.ch .mv{flex:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+ color:var(--warn);font-size:10px;cursor:help}
+.secl.tg{cursor:pointer;user-select:none}
+.secl.tg:hover{color:var(--dim)}
 .warnd{width:5px;height:5px;border-radius:99px;background:var(--warn);flex:none}
 
 #rhead{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);
@@ -381,7 +386,7 @@ const LIVE=WIN||MAC;
 const info=t=>' <span class=info tabindex=0 title="'+esc(t)+'" aria-label="'+esc(t)+'">ⓘ</span>';
 const reloadHint=on=>(LIVE&&on&&S&&S.appRunning)?" · Claude shows it the next time it opens that account":"";
 const MARK=`<svg class=mk viewBox="0 0 100 100" aria-hidden=true>\n <defs><mask id="gap">\n <rect width="100" height="100" fill="#fff"/>\n <rect x="57.4" y="38.9" width="18.6" height="11.8" fill="#000"/>\n </mask></defs>\n <path mask="url(#gap)" fill="currentColor" fill-rule="evenodd"\n d="M33 26.9h24.6a11.2 11.2 0 0 1 11.2 11.2v14.8a11.2 11.2 0 0 1-11.2 11.2H33\n A11.2 11.2 0 0 1 21.8 52.9V38.1A11.2 11.2 0 0 1 33 26.9Z\n M33.9 32.9h22.8a6 6 0 0 1 6 6v13.2a6 6 0 0 1-6 6H33.9a6 6 0 0 1-6-6V38.9a6 6 0 0 1 6-6Z"/>\n <path mask="url(#gap)" fill="currentColor" d="M31.2 63.4h14.1l-15 13.4Z"/>\n <rect x="42.5" y="42" width="33.5" height="5.6" rx="2.8" fill="#d97757"/>\n <path fill="#d97757" d="M81.2 44.8 70.8 37.9v13.8Z"/>\n </svg>`;
-let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0;
+let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0,showArch=false;
 
 function toast(m,err){const t=$("#toast");t.textContent=m;t.className="on"+(err?" err":"");
  clearTimeout(t._x);t._x=setTimeout(()=>t.className="",err?5200:2400);}
@@ -872,6 +877,13 @@ async function load(hold){
 const key=s=>(s.root||"")+"|"+s.acct+"|"+s.org;
 const scope=()=>S.scopes.find(s=>key(s)===scopeKey);
 const label=s=>(s.profile&&s.profile.email)||s.label||s.acct.slice(0,8);
+// Archived chats are counted and listed apart, the way Claude keeps them.
+const live=s=>s.chats.filter(c=>!c.archived);
+const nChats=n=>n+' chat'+(n===1?'':'s');
+// A chat Claude saved back into the account a move took it out of
+const mvTo=c=>{const t=S.scopes.find(s=>key(s)===c.movedTo);return t?short(t):"another account";};
+const mvTip=c=>"Moved to "+mvTo(c)+". Claude put this copy back because the chat was open in this account's window. "+
+  "Archive it in that window. Don't delete it in Claude: that can remove the conversation the moved copy uses.";
 
 function diagPanel(){
   const d=(S&&S.diag)||{};
@@ -964,9 +976,9 @@ function drawSide(){
     const ini=isSrc(s)?srcMark(s):esc(((s.profile&&s.profile.name)||nm).slice(0,2).toUpperCase());
     const mail=s.profile&&s.profile.email;
     const em=(mail&&(!isSrc(s)||isCur(s)))?mail:"";
-    const mt=isCur(s)?'Cursor · '+s.chats.length+' chat'+(s.chats.length===1?'':'s')+(s.isCurrent?' · signed in':'')
-      :isSrc(s)?s.chats.length+' chat'+(s.chats.length===1?'':'s')+' · no account yet'
-      :s.chats.length+' chat'+(s.chats.length===1?'':'s')+(s.deleted.length?' · '+s.deleted.length+' deleted':'')
+    const mt=isCur(s)?'Cursor · '+nChats(live(s).length)+(s.isCurrent?' · signed in':'')
+      :isSrc(s)?nChats(live(s).length)+' · no account yet'
+      :nChats(live(s).length)+(s.deleted.length?' · '+s.deleted.length+' deleted':'')
         +(multi&&s.rootLabel?' · '+esc(s.rootLabel):'');
     return '<div class="acct '+(isSrc(s)?'src ':'')+(isCur(s)?'cur ':'')+(key(s)===scopeKey?'on':'')+'" data-k="'+key(s)+'" onclick="pick(\''+key(s)+'\')"'+
         (RICH?' title="'+esc(whoTip(s))+'"':'')+'>'+
@@ -983,9 +995,9 @@ function drawSide(){
    +(s0&&!isSrc(s0)?'<div class=secl>rename</div><div style="padding:0 9px"><input id=nick placeholder="name this account" value="'+
       esc(s0.label||'')+'" onchange="setLabel(\''+s0.acct+'\',this.value)"></div>':'')
    +'<div class=foot title="'+esc('sessions: '+((S.paths||{}).sessions||'?')+String.fromCharCode(10)+'projects: '+((S.paths||{}).projects||'?'))+'">Ferry&nbsp;'+esc(appVer())+' · '+A.length+'&nbsp;accounts · '+
-      A.reduce((a,x)=>a+x.chats.length,0)+'&nbsp;chats · '+
+      A.reduce((a,x)=>a+live(x).length,0)+'&nbsp;chats · '+
       A.reduce((a,x)=>a+x.deleted.length,0)+'&nbsp;deleted'+
-      (R.length?'<br>'+R.reduce((a,x)=>a+x.chats.length,0)+'&nbsp;not in an account':'')+'</div>';
+      (R.length?'<br>'+R.reduce((a,x)=>a+live(x).length,0)+'&nbsp;not in an account':'')+'</div>';
   const canDrop=el=>{
     if(!dragged||el.dataset.k===scopeKey)return false;
     const t=S.scopes.find(s=>key(s)===el.dataset.k),[from]=chatAt(dragged);
@@ -1012,17 +1024,27 @@ function drawEmpty(){ $("#read").innerHTML=diagPanel(); $("#list").innerHTML="";
 
 function drawList(){
   const s=scope();if(!s)return;
-  const L=s.chats.filter(c=>!q||c.title.toLowerCase().includes(q));
-  $("#list").innerHTML='<input id=q placeholder="Search '+s.chats.length+' chat'+(s.chats.length===1?'':'s')+'" value="'+esc(q)+'">'
-   +(L.length?L.map(c=>'<div class="ch '+(chatPath===c.path?'on':'')+'" draggable=true data-p="'+esc(c.path)+
+  const hit=c=>!q||c.title.toLowerCase().includes(q);
+  const on=live(s),off=s.chats.filter(c=>c.archived),L=on.filter(hit),LA=off.filter(hit);
+  const row=c=>'<div class="ch '+(c.archived?'arch ':'')+(chatPath===c.path?'on':'')+'" draggable=true data-p="'+esc(c.path)+
       '" onclick="openChat(this.dataset.p)"'+
       // a CLI chat is known by the folder it ran in, so say which one
       (c.source&&c.cwd?' title="'+esc(c.cwd)+'"':'')+'>'+
       (c.missing?'<span class=warnd title="transcript pruned"></span>':'')+
-      '<span class=t>'+esc(c.title)+'</span><span class=n>'+(c.turns||0)+'</span></div>').join("")
+      '<span class=t>'+esc(c.title)+'</span>'+
+      (c.movedTo?'<span class=mv title="'+esc(mvTip(c))+'">→ '+esc(mvTo(c))+'</span>':'')+
+      '<span class=n>'+(c.turns||0)+'</span></div>';
+  // a search looks in the archive too, and opens it to show what it found
+  const openA=showArch||!!q;
+  $("#list").innerHTML='<input id=q placeholder="Search '+nChats(on.length)+'" value="'+esc(q)+'">'
+   +(L.length?L.map(row).join("")
      // an account just signed into has no chats yet; that is not a search miss
-     :'<div class=empty style="padding:40px 10px">'+(s.chats.length?'No match'
+     :q&&LA.length?''
+     :'<div class=empty style="padding:40px 10px">'+(q?'No match'
+       :on.length?'':off.length?'Every chat here is archived.'
        :'No chats yet. Drag one here from another account.')+'</div>')
+   +(LA.length?'<div class="secl tg" onclick="showArch=!showArch;drawList()" title="Chats archived in Claude">archived · '+
+      LA.length+(openA?' ▾':' ▸')+'</div>'+(openA?LA.map(row).join(""):''):'')
    +(s.deleted.length?'<div class=secl>deleted</div>'+s.deleted.map(d=>'<div class="ch dead">'+
       '<span class=t title="'+esc(d.id)+'">'+esc(d.title||d.id.slice(6,18))+'</span>'+
       '<button class="btn sm" onclick="undel(\''+d.id+'\')">Restore</button></div>').join(""):"");
@@ -1069,6 +1091,7 @@ function drawRead(d){
   // and the row below offers to add it to an account rather than to send it on
   const r=d.rec,src=isSrc(scope()),others=accts().filter(x=>key(x)!==scopeKey);curD=d;
   const held=(d.total||0)-d.msgs.length;      // Cursor only: what a big chat is still holding
+  const lo=((scope()||{}).chats||[]).find(c=>c.path===chatPath&&c.movedTo);   // left behind by a move
   const meta=esc((r.model||"").replace("claude-",""))+' · '+(r.completedTurns||0)+
        ' turns · '+day(r.createdAt)+' → '+day(r.lastActivityAt)+' · '+d.files.length+
        ' transcripts · '+fmt(d.bytes)+(d.subs?' · '+d.subs+' subagent':'')+
@@ -1103,6 +1126,7 @@ function drawRead(d){
        '<span style="flex:1"></span>'+fileops+'</div>')+
      '</div>'+
    '<div id=body>'+
+     (lo?'<div class=more><p>'+esc(mvTip(lo))+'</p></div>':'')+
      (!d.full&&held>0?'<div class=more><p>Showing the newest '+d.msgs.length+' of '+d.total+
         ' messages. The '+held+' older ones are not loaded yet.</p>'+
         '<button class="btn sm" id=more onclick=loadAll()>Load all</button></div>':'')+
