@@ -1051,6 +1051,77 @@ mod moved_tests {
         assert_eq!(s["a|x|o"]["chats"][0]["movedTo"], "b|y|o");
         assert!(s["a|x|o"]["deleted"].as_array().unwrap().is_empty());
     }
+
+    #[test]
+    fn a_chat_moved_back_leaves_a_duplicate_in_its_own_account() {
+        let mut s = scopes(json!({
+            "a|x|o": { "chats": [ {"id": "local_old", "conv": "c1"}, {"id": "local_new", "conv": "c1"} ],
+                       "deleted": [{"id": "local_old"}] },
+            "b|y|o": { "chats": [ {"id": "local_q", "conv": "c1", "archived": true} ], "deleted": [] }
+        }));
+        super::mark_moved(&mut s);
+        assert_eq!(s["a|x|o"]["chats"][0]["movedTo"], "a|x|o", "the live record beside it wins over an archived one");
+        assert!(s["a|x|o"]["chats"][1]["movedTo"].is_null());
+    }
+
+    fn put(dir: &std::path::Path, id: &str, rec: serde_json::Value) {
+        let mut r = rec;
+        r["sessionId"] = json!(format!("local_{id}"));
+        std::fs::write(dir.join(format!("local_{id}.json")), r.to_string()).unwrap();
+    }
+    fn tomb(dir: &std::path::Path, id: &str) { std::fs::write(dir.join(format!("deleted_{id}")), "1").unwrap(); }
+
+    #[test]
+    fn a_closed_profile_lets_go_of_its_leftovers_and_their_forks_find_the_record_that_stays() {
+        let base = std::env::temp_dir().join(format!("ferry-finish-{}", std::process::id()));
+        let (a, b, c) = (base.join("A/acct/org"), base.join("B/acct/org"), base.join("C/acct/org"));
+        for d in [&a, &b, &c] { std::fs::create_dir_all(d).unwrap(); }
+        // A, closed: a leftover with a fork, and the record of the same chat that stays
+        put(&a, "x", json!({"cliSessionId": "c1", "title": "left"}));   tomb(&a, "x");
+        put(&a, "x2", json!({"cliSessionId": "c1", "title": "stays"}));
+        put(&a, "f", json!({"cliSessionId": "cf", "forkedFromSessionId": "local_x"}));
+        // a deleted chat that lives nowhere else is not a leftover
+        put(&a, "n", json!({"cliSessionId": "c9"}));                     tomb(&a, "n");
+        put(&a, "z", json!({"cliSessionId": "c2"}));
+        put(&a, "h", json!({"cliSessionId": "c3"}));
+        // B is open: its leftover waits
+        put(&b, "y", json!({"cliSessionId": "c2"}));                     tomb(&b, "y");
+        // C, closed: a leftover whose fork stays and has no record here to go to
+        put(&c, "k", json!({"cliSessionId": "c3"}));                     tomb(&c, "k");
+        put(&c, "kf", json!({"cliSessionId": "ck", "forkedFromSessionId": "local_k"}));
+        let p = |d: &std::path::PathBuf| d.to_string_lossy().to_string();
+        let dirs = vec![(p(&base.join("A")), p(&a)), (p(&base.join("B")), p(&b)), (p(&base.join("C")), p(&c))];
+        let open = p(&base.join("B"));
+        let n = super::finish_moves_in(&dirs, |r| r == open);
+        assert_eq!(n, 1);
+        assert!(!a.join("local_x.json").exists(), "the leftover went");
+        assert!(a.join("deleted_x").exists(), "and stays on the deleted list");
+        let f: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(a.join("local_f.json")).unwrap()).unwrap();
+        assert_eq!(f["forkedFromSessionId"], "local_x2", "its fork follows the record that stays");
+        assert!(a.join("local_n.json").exists());
+        assert!(b.join("local_y.json").exists(), "an open Claude still holds it");
+        assert!(c.join("local_k.json").exists(), "its fork would lose its parent");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_turn_is_open_until_claude_has_answered() {
+        let l = |v: serde_json::Value| v.to_string();
+        let done = [l(json!({"type":"user","message":{"content":"hi"}})),
+                    l(json!({"type":"assistant","message":{"stop_reason":"end_turn"}})),
+                    l(json!({"type":"system","subtype":"stop_hook_summary"}))].join("\n");
+        assert!(!super::turn_open(&done));
+        let tool = [l(json!({"type":"assistant","message":{"stop_reason":"tool_use"}})),
+                    l(json!({"type":"queue-operation"}))].join("\n");
+        assert!(super::turn_open(&tool));
+        let asked = format!("{}\n{}", done, l(json!({"type":"user","message":{"content":[{"type":"tool_result"}]}})));
+        assert!(super::turn_open(&asked));
+        let stopped = l(json!({"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}));
+        assert!(!super::turn_open(&stopped));
+        let meta = format!("{}\n{}", done, l(json!({"type":"user","isMeta":true,"message":{"content":"Caveat"}})));
+        assert!(!super::turn_open(&meta));
+        assert!(!super::turn_open("{\"partial"), "a cut line says nothing");
+    }
 }
 
 /// Handing a chat to an open Claude through `claude://resume`. Nothing here
@@ -2982,7 +3053,8 @@ fn diagnostics() -> Value {
 #[cfg_attr(target_os = "windows", tauri::command(async))]
 #[cfg_attr(not(target_os = "windows"), tauri::command)]
 fn scan() -> Value {
-    let cur = read_json(&cfg()).and_then(|c| c["lastKnownAccountUuid"].as_str().map(String::from));
+    let finished = finish_moves();
+    let cur =read_json(&cfg()).and_then(|c| c["lastKnownAccountUuid"].as_str().map(String::from));
     // Each profile is signed into its own account, so "the one you are signed
     // into" is a question per root, not per machine.
     let cur_in: std::collections::HashMap<String, String> = roots().iter().filter_map(|r| {
@@ -3106,7 +3178,7 @@ fn scan() -> Value {
     // imported from, not an account you can send one to.
     list.extend(source_scopes(&claimed));
     if let Some(c) = cursor_scope() { list.push(c); }
-    json!({ "scopes": list, "current": cur, "appRunning": app_running(),
+    json!({ "scopes": list, "current": cur, "appRunning": app_running(), "finished": finished,
             "cursorRunning": cursor_running(),
             "locations": location_list(),
             "vault": vault(), "exportDir": last_export_dir(),
@@ -3118,9 +3190,11 @@ fn scan() -> Value {
 /// Find the chats a running Claude wrote back after Ferry moved them out. A
 /// window that had the chat open keeps it in memory and saves its record again,
 /// so the record ends up beside its own tombstone while the same conversation
-/// lives on in another account. Such a chat gets `movedTo`, the key of the
-/// account it went to (one where it is not archived, if there is one), and its
-/// tombstone leaves the deleted list: there is nothing there to restore.
+/// lives on in another record - in another account, or in this one when the
+/// chat was moved back. Such a chat gets `movedTo`, the key of the account
+/// that record is in (its own key for a duplicate), and its tombstone leaves
+/// the deleted list: there is nothing there to restore. finish_moves takes it
+/// out once that profile's Claude is closed.
 fn mark_moved(scopes: &mut std::collections::BTreeMap<String, Value>) {
     let tombs = |s: &Value| -> std::collections::HashSet<String> {
         s["deleted"].as_array().map(|d| d.iter()
@@ -3143,10 +3217,11 @@ fn mark_moved(scopes: &mut std::collections::BTreeMap<String, Value>) {
         let s = scopes.get_mut(&k).unwrap();
         if let Some(c) = s["chats"].as_array_mut().unwrap().iter_mut()
             .find(|c| c["id"].as_str() == Some(id.as_str())) {
-            let there = c["conv"].as_str().and_then(|v| homes.get(v)).and_then(|h| {
-                let away: Vec<&(String, bool)> = h.iter().filter(|(hk, _)| *hk != k).collect();
-                away.iter().find(|(_, a)| !*a).or(away.first()).map(|(hk, _)| hk.clone())
-            });
+            // a record not archived first, then one in another account; the
+            // same key as the leftover's own means a duplicate in one account
+            let there = c["conv"].as_str().and_then(|v| homes.get(v))
+                .and_then(|h| h.iter().min_by_key(|e| (e.1, e.0 == k)))
+                .map(|e| e.0.clone());
             if let Some(to) = there { c["movedTo"] = json!(to); } else { continue; }
         }
         s["deleted"].as_array_mut().unwrap().retain(|d| d["id"].as_str() != Some(id.as_str()));
@@ -3388,9 +3463,9 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     let forks = if same_dir(&src_dir, &dst_dir) { vec![] } else { forks_of(&src_dir, &sid) };
     if mv {
         if let Some((_, r)) = std::iter::once((path.clone(), rec.clone())).chain(forks.iter().cloned())
-            .find(|(_, r)| busy_in_claude(r))
+            .find(|(_, r)| busy_in_claude(&src.path, r))
         {
-            let msg = "is working in Claude right now, so the window running it would write it straight back. Move it once it has finished; a copy works now.";
+            let msg = "is in the middle of a reply in Claude. Move it when that reply has finished; a copy works now.";
             return Err(format!("\u{201c}{}\u{201d} {}", r["title"].as_str().unwrap_or("This chat"), msg));
         }
     }
@@ -3412,10 +3487,10 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
     // every fork in that account now finds its parent by its id there
     let relinked = mend_lineage(&dst_dir);
     Ok(json!({ "ok": true, "wrote": first.wrote, "moved": mv, "live": first.live, "newId": first.new_id,
-               "forks": carried, "relinked": relinked }))
+               "already": first.already, "forks": carried, "relinked": relinked }))
 }
 
-struct Landed { wrote: String, live: bool, new_id: bool }
+struct Landed { wrote: String, live: bool, new_id: bool, already: bool }
 
 /// One chat into one account. With that account open in a running Claude, it
 /// is handed to Claude through its own door (hand_to_open_claude): Claude
@@ -3427,9 +3502,35 @@ fn transfer_one(path: &str, rec: &Value, dst: &Root, acct: &str, dst_dir: &str, 
 {
     let sid = rec["sessionId"].as_str().ok_or("no sessionId")?.to_string();
     let short = sid.trim_start_matches("local_").to_string();
+    let src_dir = Path::new(path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    // The account has this conversation already: the chat is coming back to
+    // where a move took it from (an open window kept its copy), or was copied
+    // here before. A second record would list it twice, and so would a hand-off,
+    // since Claude adopts it under a new id. The record there stays, taken off
+    // the deleted list and, where nothing holds it, out of the archive.
+    if let (Some(cli), false) = (rec["cliSessionId"].as_str(), same_dir(&src_dir, dst_dir)) {
+        if let Some((have, hrec)) = home_in(dst_dir, cli) {
+            let hid = hrec["sessionId"].as_str().unwrap_or("").to_string();
+            let tomb = format!("{}/deleted_{}", dst_dir, hid.trim_start_matches("local_"));
+            if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
+            if hrec["isArchived"].as_bool().unwrap_or(false) {
+                if !app_running_in(&dst.path) {
+                    let mut r = hrec.clone();
+                    r["isArchived"] = json!(false);
+                    snapshot(&have, "unarchive");
+                    let _ = write_record(&have, &serde_json::to_string_pretty(&r).unwrap());
+                } else if hid == format!("local_{cli}") {
+                    // Claude's own door unarchives a chat it already adopted
+                    let _ = hand_to_open_claude(dst, acct, cli);
+                }
+            }
+            if mv { move_out(path, &short); }
+            return Ok(Landed { wrote: have, live: false, new_id: false, already: true });
+        }
+    }
     if let Some(wrote) = rec["cliSessionId"].as_str().and_then(|cli| hand_to_open_claude(dst, acct, cli)) {
         if mv { move_out(path, &short); }
-        return Ok(Landed { wrote, live: true, new_id: false });
+        return Ok(Landed { wrote, live: true, new_id: false, already: false });
     }
 
     // the chat's own id, unless that account deleted it and its Claude is open
@@ -3447,7 +3548,19 @@ fn transfer_one(path: &str, rec: &Value, dst: &Root, acct: &str, dst_dir: &str, 
     if Path::new(&tomb).exists() { snapshot(&tomb, "undelete"); let _ = fs::remove_file(&tomb); }
 
     if mv { move_out(path, &short); }
-    Ok(Landed { wrote: to, live: false, new_id: id != sid })
+    Ok(Landed { wrote: to, live: false, new_id: id != sid, already: false })
+}
+
+/// The record an account folder already has for a conversation, if any: one
+/// that is not on its deleted list first, then one that is not archived.
+fn home_in(dir: &str, cli: &str) -> Option<(String, Value)> {
+    let tombed = |r: &Value| r["sessionId"].as_str()
+        .map(|id| Path::new(&format!("{}/deleted_{}", dir, id.trim_start_matches("local_"))).exists())
+        .unwrap_or(false);
+    let mut have: Vec<(String, Value)> = records_in(dir).into_iter()
+        .filter(|(_, r)| r["cliSessionId"].as_str() == Some(cli)).collect();
+    have.sort_by_key(|(_, r)| (tombed(r), r["isArchived"].as_bool().unwrap_or(false)));
+    have.into_iter().next()
 }
 
 /// A fork names its parent by the parent's session id, in any of these, and
@@ -3490,17 +3603,58 @@ fn restore_lineage(wrote: &str, src: &Value) {
     if changed { let _ = write_record(wrote, &serde_json::to_string_pretty(&r).unwrap()); }
 }
 
-/// A chat Claude is working on right now: its conversation was written to in
-/// the last two minutes. Moving it out from under the window that runs it
-/// does not move it - that window writes its record straight back, and two
-/// windows would be writing one conversation.
-fn busy_in_claude(rec: &Value) -> bool {
-    let recent = std::time::Duration::from_secs(120);
+/// A chat in the middle of a reply in a Claude window that is open: its newest
+/// turn has not ended, and its conversation was written to in the last ten
+/// minutes. Moving it out from under that window does not move it - the
+/// window writes its record straight back, and two windows would be writing
+/// one conversation. A chat that has finished moves, and so does any chat
+/// while that profile's Claude is closed.
+fn busy_in_claude(root: &str, rec: &Value) -> bool {
+    if !app_running_in(root) { return false; }
+    let recent = std::time::Duration::from_secs(600);
     transcripts_for(rec).iter()
         .filter(|t| t["exists"].as_bool().unwrap_or(false))
         .filter_map(|t| t["path"].as_str())
-        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
-        .any(|m| m.elapsed().map(|e| e < recent).unwrap_or(true))
+        .any(|p| {
+            let fresh = fs::metadata(p).and_then(|m| m.modified()).ok()
+                .and_then(|m| m.elapsed().ok()).map(|e| e < recent).unwrap_or(false);
+            fresh && mid_turn(p)
+        })
+}
+
+/// Whether a conversation's newest turn is still going, read from the end of
+/// its transcript: the last message is a prompt or a tool result Claude has
+/// not answered yet, or a reply that called a tool or is still streaming.
+fn mid_turn(path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let take = len.min(2 << 20);
+    if f.seek(SeekFrom::Start(len - take)).is_err() { return false; }
+    let mut buf = Vec::with_capacity(take as usize);
+    if f.take(take).read_to_end(&mut buf).is_err() { return false; }
+    turn_open(&String::from_utf8_lossy(&buf))
+}
+
+fn turn_open(tail: &str) -> bool {
+    for line in tail.lines().rev() {
+        let Ok(d) = serde_json::from_str::<Value>(line) else { continue };
+        match d["type"].as_str() {
+            Some("assistant") => {
+                let stop = d["message"]["stop_reason"].as_str();
+                return stop.is_none() || stop == Some("tool_use");
+            }
+            // notes Claude Code adds around local commands are not prompts
+            Some("user") if d["isMeta"].as_bool().unwrap_or(false) => continue,
+            Some("user") => {
+                let c = &d["message"]["content"];
+                let text = c.as_str().map(String::from).unwrap_or_else(|| c.to_string());
+                return !text.contains("[Request interrupted by user");
+            }
+            _ => continue,
+        }
+    }
+    false
 }
 
 /// The records in one account-and-organisation folder.
@@ -3570,6 +3724,62 @@ fn mend_lineage_with(dir: &str, conversation: impl Fn(&str) -> Option<String>) -
         }
     }
     mended
+}
+
+/// Finish the moves an open Claude held up. A window that had a chat open saves
+/// its record again after Ferry moved it out, so that record sits beside its own
+/// tombstone while the conversation keeps a record without one, in this account
+/// or another. Once that profile's Claude is closed nothing holds the copy any
+/// more: it is taken out (snapshotted first, so it can be restored) and its
+/// forks are pointed at the record that stays. How many it took out.
+#[cfg_attr(target_os = "windows", tauri::command(async))]
+#[cfg_attr(not(target_os = "windows"), tauri::command)]
+fn finish_moves() -> usize {
+    let mut dirs: Vec<(String, String)> = vec![];
+    for (root, _, _, dir) in scopes_on_disk() {
+        let d = dir.to_string_lossy().to_string();
+        if !dirs.iter().any(|(_, x)| same_dir(x, &d)) { dirs.push((root.path.clone(), d)); }
+    }
+    finish_moves_in(&dirs, |r| app_running_in(r))
+}
+
+/// finish_moves over given (profile, account folder) pairs; `running` says
+/// whether a profile's Claude is open.
+fn finish_moves_in(dirs: &[(String, String)], running: impl Fn(&str) -> bool) -> usize {
+    let tombed = |dir: &str, id: &str|
+        Path::new(&format!("{}/deleted_{}", dir, id.trim_start_matches("local_"))).exists();
+    let all: Vec<(&str, &str, Vec<(String, Value)>)> =
+        dirs.iter().map(|(r, d)| (r.as_str(), d.as_str(), records_in(d))).collect();
+    // where each conversation keeps a record that is not on a deleted list
+    let mut homes: Vec<(String, String)> = vec![];
+    for &(_, d, ref recs) in &all {
+        for (_, r) in recs {
+            if let (Some(id), Some(c)) = (r["sessionId"].as_str(), r["cliSessionId"].as_str()) {
+                if !tombed(d, id) { homes.push((d.to_string(), c.to_string())); }
+            }
+        }
+    }
+    let mut done = 0;
+    for &(root, d, ref recs) in &all {
+        if running(root) { continue; }
+        let mut gone: std::collections::HashMap<String, String> = Default::default();
+        for (p, r) in recs {
+            let (Some(id), Some(c)) = (r["sessionId"].as_str(), r["cliSessionId"].as_str()) else { continue };
+            if !tombed(d, id) || !homes.iter().any(|(_, hc)| hc == c) { continue; }
+            // a fork that stays here needs a record of the same conversation here
+            // to be pointed at, or it would lose its parent
+            let here = homes.iter().any(|(hd, hc)| hd == d && hc == c);
+            let kids = recs.iter().any(|(_, k)| parent_of(k).as_deref() == Some(id)
+                && k["sessionId"].as_str().map(|kid| !tombed(d, kid)).unwrap_or(false));
+            if kids && !here { continue; }
+            snapshot(p, "finish-move");
+            if remove_record(p).is_ok() { done += 1; gone.insert(id.to_string(), c.to_string()); }
+        }
+        if !gone.is_empty() {
+            mend_lineage_with(d, |id| gone.get(id).cloned().or_else(|| conversation_of(id)));
+        }
+    }
+    done
 }
 
 /// The source half of a move: snapshot the record, take it out of the account
@@ -4047,7 +4257,7 @@ fn main() {
             scan, chat_detail, chat_full, export_chat, copy_chat, import_session, export_to_cursor,
             set_folder, rename_chat, delete_chat, undelete_chat, set_label, run_vault, set_zoom,
             nearby, nearby_state, nearby_send, nearby_answer, nearby_confirm, nearby_cancel,
-            nearby_dismiss, pick_folder, locations, add_location, remove_location
+            nearby_dismiss, pick_folder, locations, add_location, remove_location, finish_moves
         ])
         .run(tauri::generate_context!())
         .expect("failed to launch Ferry");

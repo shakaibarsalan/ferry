@@ -386,7 +386,7 @@ const LIVE=WIN||MAC;
 const info=t=>' <span class=info tabindex=0 title="'+esc(t)+'" aria-label="'+esc(t)+'">ⓘ</span>';
 const reloadHint=on=>(LIVE&&on&&S&&S.appRunning)?" · Claude shows it the next time it opens that account":"";
 const MARK=`<svg class=mk viewBox="0 0 100 100" aria-hidden=true>\n <defs><mask id="gap">\n <rect width="100" height="100" fill="#fff"/>\n <rect x="57.4" y="38.9" width="18.6" height="11.8" fill="#000"/>\n </mask></defs>\n <path mask="url(#gap)" fill="currentColor" fill-rule="evenodd"\n d="M33 26.9h24.6a11.2 11.2 0 0 1 11.2 11.2v14.8a11.2 11.2 0 0 1-11.2 11.2H33\n A11.2 11.2 0 0 1 21.8 52.9V38.1A11.2 11.2 0 0 1 33 26.9Z\n M33.9 32.9h22.8a6 6 0 0 1 6 6v13.2a6 6 0 0 1-6 6H33.9a6 6 0 0 1-6-6V38.9a6 6 0 0 1 6-6Z"/>\n <path mask="url(#gap)" fill="currentColor" d="M31.2 63.4h14.1l-15 13.4Z"/>\n <rect x="42.5" y="42" width="33.5" height="5.6" rx="2.8" fill="#d97757"/>\n <path fill="#d97757" d="M81.2 44.8 70.8 37.9v13.8Z"/>\n </svg>`;
-let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0,showArch=false;
+let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0,showArch=false,showMoved=false;
 
 function toast(m,err){const t=$("#toast");t.textContent=m;t.className="on"+(err?" err":"");
  clearTimeout(t._x);t._x=setTimeout(()=>t.className="",err?5200:2400);}
@@ -519,7 +519,8 @@ async function transfer(path,t,mv){
       ? "Written, but no Cursor workspace matched that folder, so it is in no chat list"
       : ok+(res&&res.newId?" as a new chat":"")+                       // see transfer_id
         (res&&res.forks?" with its "+res.forks+" fork"+(res.forks>1?"s":""):"")+   // see forks_of
-        (res&&res.live?" · open in Claude now":reloadHint(!toCur)));   // see hand_to_open_claude
+        (res&&res.already?" · it was already there, so no second copy"   // see home_in
+         :res&&res.live?" · open in Claude now":reloadHint(!toCur)));   // see hand_to_open_claude
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
@@ -873,17 +874,32 @@ async function load(hold){
   drawSide();
   if(!S.scopes.length){ drawEmpty(); return; }
   drawList();
+  if(S.finished)toast("Finished "+S.finished+" move"+(S.finished>1?"s":"")+" a closed Claude window had held up");
 }
+// A move an open Claude window held up finishes once that window is closed:
+// look every half minute while Ferry is open.
+if(INAPP)setInterval(async()=>{
+  if(busyOn)return;
+  try{const n=await iv("finish_moves");
+    if(n>0){await load();toast("Finished "+n+" move"+(n>1?"s":"")+": a Claude window that held "+(n>1?"them":"it")+" was closed");}}
+  catch(e){}},30000);
 const key=s=>(s.root||"")+"|"+s.acct+"|"+s.org;
 const scope=()=>S.scopes.find(s=>key(s)===scopeKey);
 const label=s=>(s.profile&&s.profile.email)||s.label||s.acct.slice(0,8);
-// Archived chats are counted and listed apart, the way Claude keeps them.
-const live=s=>s.chats.filter(c=>!c.archived);
+// Archived chats, and copies an open window kept after a move, are counted and
+// listed apart from the chats that live in an account.
+const live=s=>s.chats.filter(c=>!c.archived&&!c.movedTo);
 const nChats=n=>n+' chat'+(n===1?'':'s');
-// A chat Claude saved back into the account a move took it out of
+// A copy Claude saved back into an account a move took the chat out of: the
+// chat lives on in another account, or in a second record in this one
+const isDup=(c,s)=>c.movedTo===key(s);
 const mvTo=c=>{const t=S.scopes.find(s=>key(s)===c.movedTo);return t?short(t):"another account";};
-const mvTip=c=>"Moved to "+mvTo(c)+". Claude put this copy back because the chat was open in this account's window. "+
-  "Archive it in that window. Don't delete it in Claude: that can remove the conversation the moved copy uses.";
+const mvTag=(c,s)=>'<span class=mv title="'+esc(mvTip(c,s))+'">'+(isDup(c,s)?'duplicate':'→ '+esc(mvTo(c)))+'</span>';
+const mvTip=(c,s)=>(isDup(c,s)?"A second copy of a chat that stays in this account. ":"Moved to "+mvTo(c)+". ")+
+  "Claude put it back because the chat was open in this account's window. Ferry removes it, and moves its forks "+
+  "to the chat that stays, the next time that window is closed. Nothing is lost. Don't delete it in Claude.";
+const MOVEDTIP="Copies Claude kept here after a move, because this account's window had them open. "+
+  "Ferry removes them the next time that window is closed.";
 
 function diagPanel(){
   const d=(S&&S.diag)||{};
@@ -1025,24 +1041,26 @@ function drawEmpty(){ $("#read").innerHTML=diagPanel(); $("#list").innerHTML="";
 function drawList(){
   const s=scope();if(!s)return;
   const hit=c=>!q||c.title.toLowerCase().includes(q);
-  const on=live(s),off=s.chats.filter(c=>c.archived),L=on.filter(hit),LA=off.filter(hit);
-  const row=c=>'<div class="ch '+(c.archived?'arch ':'')+(chatPath===c.path?'on':'')+'" draggable=true data-p="'+esc(c.path)+
+  const on=live(s),mo=s.chats.filter(c=>c.movedTo),off=s.chats.filter(c=>c.archived&&!c.movedTo);
+  const L=on.filter(hit),LM=mo.filter(hit),LA=off.filter(hit);
+  const row=c=>'<div class="ch '+(c.archived||c.movedTo?'arch ':'')+(chatPath===c.path?'on':'')+'" draggable=true data-p="'+esc(c.path)+
       '" onclick="openChat(this.dataset.p)"'+
       // a CLI chat is known by the folder it ran in, so say which one
       (c.source&&c.cwd?' title="'+esc(c.cwd)+'"':'')+'>'+
       (c.missing?'<span class=warnd title="transcript pruned"></span>':'')+
-      '<span class=t>'+esc(c.title)+'</span>'+
-      (c.movedTo?'<span class=mv title="'+esc(mvTip(c))+'">→ '+esc(mvTo(c))+'</span>':'')+
+      '<span class=t>'+esc(c.title)+'</span>'+(c.movedTo?mvTag(c,s):'')+
       '<span class=n>'+(c.turns||0)+'</span></div>';
-  // a search looks in the archive too, and opens it to show what it found
-  const openA=showArch||!!q;
+  // a search looks in the folded sections too, and opens them to show what it found
+  const openM=showMoved||!!q,openA=showArch||!!q;
   $("#list").innerHTML='<input id=q placeholder="Search '+nChats(on.length)+'" value="'+esc(q)+'">'
    +(L.length?L.map(row).join("")
      // an account just signed into has no chats yet; that is not a search miss
-     :q&&LA.length?''
+     :q&&(LM.length||LA.length)?''
      :'<div class=empty style="padding:40px 10px">'+(q?'No match'
-       :on.length?'':off.length?'Every chat here is archived.'
+       :s.chats.length?'No other chats here.'
        :'No chats yet. Drag one here from another account.')+'</div>')
+   +(LM.length?'<div class="secl tg" onclick="showMoved=!showMoved;drawList()" title="'+esc(MOVEDTIP)+'">moved out · '+
+      LM.length+(openM?' ▾':' ▸')+'</div>'+(openM?LM.map(row).join(""):''):'')
    +(LA.length?'<div class="secl tg" onclick="showArch=!showArch;drawList()" title="Chats archived in Claude">archived · '+
       LA.length+(openA?' ▾':' ▸')+'</div>'+(openA?LA.map(row).join(""):''):'')
    +(s.deleted.length?'<div class=secl>deleted</div>'+s.deleted.map(d=>'<div class="ch dead">'+
@@ -1126,7 +1144,7 @@ function drawRead(d){
        '<span style="flex:1"></span>'+fileops+'</div>')+
      '</div>'+
    '<div id=body>'+
-     (lo?'<div class=more><p>'+esc(mvTip(lo))+'</p></div>':'')+
+     (lo?'<div class=more><p>'+esc(mvTip(lo,scope()))+'</p></div>':'')+
      (!d.full&&held>0?'<div class=more><p>Showing the newest '+d.msgs.length+' of '+d.total+
         ' messages. The '+held+' older ones are not loaded yet.</p>'+
         '<button class="btn sm" id=more onclick=loadAll()>Load all</button></div>':'')+
