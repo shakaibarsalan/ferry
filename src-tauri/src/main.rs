@@ -691,10 +691,32 @@ fn archived_copy_in(vault: &str, id: &str) -> Option<PathBuf> {
     backups.chain(deletes).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, p)| p)
 }
 
-/// The title of a chat's newest kept copy.
-fn archived_title(id: &str) -> Option<String> {
-    read_record(&archived_copy(id)?.to_string_lossy())?["title"].as_str()
-        .filter(|t| !t.is_empty()).map(str::to_string)
+/// The newest copy Ferry kept of each record, by session id: backups
+/// (chats/<stamp>/<account>/<id>.json) and snapshots (<stamp>-<tag>-<id>.json),
+/// the later stamp winning. One listing of each folder per scan, where the list
+/// used to search the vault once for every deleted chat it named.
+fn kept_index() -> std::collections::HashMap<String, String> {
+    let mut best: std::collections::HashMap<String, (String, String)> = Default::default();
+    let mut keep = |id: &str, stamp: String, p: String| {
+        if best.get(id).map(|(s, _)| *s < stamp).unwrap_or(true) { best.insert(id.to_string(), (stamp, p)); }
+    };
+    let v = vault();
+    for b in fs::read_dir(format!("{v}/chats")).into_iter().flatten().flatten() {
+        let stamp = b.file_name().to_string_lossy().to_string();
+        for a in fs::read_dir(b.path()).into_iter().flatten().flatten() {
+            for f in fs::read_dir(a.path()).into_iter().flatten().flatten() {
+                let n = f.file_name().to_string_lossy().to_string();
+                if let Some(id) = n.strip_suffix(".json").filter(|i| i.starts_with("local_")) {
+                    keep(id, stamp.clone(), f.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    for (id, p) in snapshot_index() {
+        let stamp = Path::new(&p).file_name().map(|n| n.to_string_lossy().chars().take(15).collect()).unwrap_or_default();
+        keep(&id, stamp, p);
+    }
+    best.into_iter().map(|(id, (_, p))| (id, p)).collect()
 }
 
 fn read_json(p: &str) -> Option<Value> {
@@ -744,17 +766,21 @@ fn read_record(p: &str) -> Option<Value> {
     use std::sync::{Mutex, OnceLock};
     type Seen = std::collections::HashMap<String, (std::time::SystemTime, u64, Value)>;
     static CACHE: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let t = std::time::Instant::now();
     let meta = fs::metadata(p).ok()?;
     let (when, len) = (meta.modified().ok()?, meta.len());
     let cache = CACHE.get_or_init(|| Mutex::new(Default::default()));
     if let Ok(c) = cache.lock() {
         if let Some((w, l, v)) = c.get(p) {
-            if *w == when && *l == len { return Some(v.clone()); }
+            if *w == when && *l == len { prof::count(prof::HITS); prof::time(prof::READ, t); return Some(v.clone()); }
         }
     }
     let text = fs::read_to_string(p).ok()?;
-    let v = serde_json::from_str::<SlimRecord>(&text).map(slim_value)
-        .or_else(|_| serde_json::from_str::<Value>(&text)).ok()?;
+    let v = match serde_json::from_str::<SlimRecord>(&text) {
+        Ok(s) => { prof::count(prof::PARSED); slim_value(s) }
+        Err(_) => { prof::count(prof::FULL); serde_json::from_str::<Value>(&text).ok()? }
+    };
+    prof::time(prof::READ, t);
     if let Ok(mut c) = cache.lock() { c.insert(p.to_string(), (when, len, v.clone())); }
     Some(v)
 }
@@ -1599,25 +1625,44 @@ fn labels() -> Value { read_json(&labels_path()).unwrap_or_else(|| json!({})) }
 
 /// Only the currently logged-in account leaves a profile record; logout clears it.
 fn profiles() -> Value {
-    let mut out = json!({});
-    let re = regex::bytes::Regex::new(
+    use std::sync::{Mutex, OnceLock};
+    // (account, email, name) found in one file, kept while its time and size
+    // are unchanged: matching the pattern over every IndexedDB file took a
+    // second or more on every scan, and most of those files never change
+    type Found = Vec<(String, String, String)>;
+    type Seen = std::collections::HashMap<String, (std::time::SystemTime, u64, Found)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(Default::default()));
+    let re = RE.get_or_init(|| regex::bytes::Regex::new(
         // Claude's own UI shows display_name ("ahkamboh"), not full_name
         // ("Ali Hamza Kamboh"), so capture both and prefer the former.
         r"(?s)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}).{0,24}?email_address.{0,4}?([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})(?:.{0,16}?full_name.{0,4}?([A-Za-z0-9 ._\-]{2,40}))?(?:.{0,16}?display_name.{0,4}?([A-Za-z0-9 ._\-]{2,40}))?"
-    ).unwrap();
+    ).unwrap());
+    let mut out = json!({});
     let dbs: Vec<String> = roots().iter().map(|r| idb_in(&r.path)).collect();
     for e in dbs.iter().flat_map(|d| walkdir::WalkDir::new(d).into_iter().filter_map(|e| e.ok())) {
         if !e.file_type().is_file() { continue; }
-        let Ok(b) = fs::read(e.path()) else { continue };
-        for c in re.captures_iter(&b) {
-            let uuid = String::from_utf8_lossy(&c[1]).to_string();
-            let email = String::from_utf8_lossy(&c[2]).to_string();
-            let pick = |i: usize| c.get(i)
-                .map(|m| String::from_utf8_lossy(m.as_bytes()).trim().to_string())
-                .filter(|x| !x.is_empty());
-            let name = pick(4).or_else(|| pick(3)).unwrap_or_default();   // display_name, else full_name
-            out[uuid] = json!({ "email": email, "name": name });
-        }
+        let path = e.path().to_string_lossy().to_string();
+        let stamp = e.metadata().ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        let kept = stamp.and_then(|(w, l)| seen.lock().ok()?.get(&path)
+            .filter(|(sw, sl, _)| *sw == w && *sl == l).map(|(_, _, f)| f.clone()));
+        let found: Found = match kept {
+            Some(f) => f,
+            None => {
+                let Ok(b) = fs::read(e.path()) else { continue };
+                let f: Found = re.captures_iter(&b).map(|c| {
+                    let pick = |i: usize| c.get(i)
+                        .map(|m| String::from_utf8_lossy(m.as_bytes()).trim().to_string())
+                        .filter(|x| !x.is_empty());
+                    (String::from_utf8_lossy(&c[1]).to_string(), String::from_utf8_lossy(&c[2]).to_string(),
+                     pick(4).or_else(|| pick(3)).unwrap_or_default())   // display_name, else full_name
+                }).collect();
+                if let (Some((w, l)), Ok(mut s)) = (stamp, seen.lock()) { s.insert(path, (w, l, f.clone())); }
+                f
+            }
+        };
+        for (uuid, email, name) in found { out[uuid] = json!({ "email": email, "name": name }); }
     }
     known_profiles(&mut out);
     out
@@ -1681,7 +1726,9 @@ fn known_profiles(found: &mut Value) {
 /// Every transcript that makes up one chat: current + prior sessions + their subagents.
 fn transcripts_for(rec: &Value) -> Vec<Value> {
     let cwd = rec["cwd"].as_str().unwrap_or("");
+    let t = std::time::Instant::now();
     let dir = project_dir(cwd);
+    prof::time(prof::DIR, t);
     let mut ids: Vec<String> = vec![];
     if let Some(s) = rec["cliSessionId"].as_str() { ids.push(s.into()); }
     // older builds: priorCliSessionIds. newer / Windows builds: bridgeSessionIds.
@@ -1697,21 +1744,21 @@ fn transcripts_for(rec: &Value) -> Vec<Value> {
     ids.iter().map(|id| {
         let mut here = dir.clone();
         let mut main = format!("{}/{}.jsonl", here, id);
-        if !Path::new(&main).exists() {
+        let mut meta = fs::metadata(&main).ok();
+        if meta.is_none() {
+            let t = std::time::Instant::now();
             if let Some(p) = misfiled(cwd, id) {
                 here = Path::new(&p).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or(here);
                 main = p;
+                meta = fs::metadata(&main).ok();
             }
+            prof::time(prof::MISS, t);
         }
-        let size = fs::metadata(&main).map(|m| m.len()).unwrap_or(0);
-        let mut subs = 0u64; let mut sub_bytes = 0u64;
-        if let Ok(rd) = glob::glob(&format!("{}/{}/subagents/*.jsonl", here, id)) {
-            for p in rd.flatten() {
-                subs += 1;
-                sub_bytes += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            }
-        }
-        json!({ "id": id, "path": main, "exists": Path::new(&main).exists(),
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let t = std::time::Instant::now();
+        let (subs, sub_bytes) = subagents_of(&here, id);
+        prof::time(prof::SUBS, t);
+        json!({ "id": id, "path": main, "exists": meta.is_some(),
                 "size": size, "subagents": subs, "subBytes": sub_bytes })
     }).collect()
 }
@@ -1898,12 +1945,17 @@ fn session_info(cache: &mut Value, path: &str, dirty: &mut bool) -> Option<Value
 }
 
 /// How many subagent transcripts one session left behind, and how big they are.
+/// How many subagent transcripts a session has, and their bytes: one listing of
+/// its subagents folder. A glob of the whole path checked every folder on the way
+/// down, a dozen or more calls per chat, and on a busy Windows that was most of
+/// a scan.
 fn subagents_of(dir: &str, id: &str) -> (u64, u64) {
     let (mut n, mut bytes) = (0u64, 0u64);
-    if let Ok(g) = glob::glob(&format!("{}/{}/subagents/*.jsonl", dir, id)) {
-        for p in g.flatten() {
+    if let Ok(rd) = fs::read_dir(format!("{}/{}/subagents", dir, id)) {
+        for e in rd.flatten() {
+            if !e.file_name().to_string_lossy().ends_with(".jsonl") { continue; }
             n += 1;
-            bytes += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
         }
     }
     (n, bytes)
@@ -2605,7 +2657,26 @@ pub fn cursor_write_transcript(chat: &Value) -> Result<String, String> {
 /// one is written, so they are addressed by "cursor:<conversation id>".
 /// Shown whenever the DB file exists, even with 0 chats: the send-to list
 /// and the sidebar drop target need the row, not a conversation count.
+/// cursor_scope as it was last read, while Cursor's database (and its
+/// write-ahead log) keeps its time and size: reading the conversation list out
+/// of a database of many gigabytes took a second or more on every scan.
 pub fn cursor_scope() -> Option<Value> {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<(String, Value)>>> = OnceLock::new();
+    let db = cursor_db()?;
+    let stamp = |p: &str| fs::metadata(p).ok()
+        .map(|m| format!("{:?}/{}", m.modified().ok(), m.len())).unwrap_or_default();
+    let key = format!("{}|{}", stamp(&db), stamp(&format!("{db}-wal")));
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = last.lock() {
+        if let Some((k, v)) = g.as_ref() { if *k == key { return Some(v.clone()); } }
+    }
+    let v = cursor_scope_now()?;
+    if let Ok(mut g) = last.lock() { *g = Some((key, v.clone())); }
+    Some(v)
+}
+
+fn cursor_scope_now() -> Option<Value> {
     if cursor_db().is_none() { return None; }
     let chats = cursor_chats();
     let mut list: Vec<Value> = chats.iter().map(|c| json!({
@@ -3153,6 +3224,7 @@ fn diagnostics() -> Value {
 fn scan() -> Value {
     // how long each step took, returned with the scan for whoever needs to know
     let mut laps = Laps::new();
+    prof::take();
     let finished = finish_moves();
     laps.lap("finishMoves");
     let cur =read_json(&cfg()).and_then(|c| c["lastKnownAccountUuid"].as_str().map(String::from));
@@ -3250,7 +3322,7 @@ fn scan() -> Value {
     }
     laps.lap("records");
     mark_moved(&mut scopes);
-    let snaps = snapshot_index();
+    let snaps = kept_index();
     // A deleted entry for a chat the account has under another id - it came
     // back as a new chat, or a move back reused the record there - would restore
     // only a second copy of it, so it is not listed.
@@ -3282,7 +3354,7 @@ fn scan() -> Value {
     for s in scopes.values_mut() {
         for d in s["deleted"].as_array_mut().unwrap() {
             let id = d["id"].as_str().unwrap_or("").to_string();
-            if let Some(t) = titles.get(&id).cloned().or_else(|| archived_title(&id)).or_else(|| snap_title(&id)) {
+            if let Some(t) = titles.get(&id).cloned().or_else(|| snap_title(&id)) {
                 d["title"] = json!(t);
             }
         }
@@ -3368,6 +3440,32 @@ fn mark_moved(scopes: &mut std::collections::BTreeMap<String, Value>) {
     }
 }
 
+/// Where a scan's per-chat work goes, summed over the scan: microseconds in
+/// the slots that time something, a count in the others. scan returns it
+/// with its own step times and starts the next scan from zero.
+mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub const DIR: usize = 0;
+    pub const SUBS: usize = 1;
+    pub const MISS: usize = 2;
+    pub const READ: usize = 3;
+    pub const HITS: usize = 4;
+    pub const PARSED: usize = 5;
+    pub const FULL: usize = 6;
+    static SLOTS: [AtomicU64; 7] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                                    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    pub fn time(slot: usize, since: std::time::Instant) {
+        SLOTS[slot].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
+    }
+    pub fn count(slot: usize) { SLOTS[slot].fetch_add(1, Relaxed); }
+    pub fn take() -> serde_json::Value {
+        let v: Vec<u64> = SLOTS.iter().map(|s| s.swap(0, Relaxed)).collect();
+        serde_json::json!({ "projectDirMs": v[DIR] / 1000, "subagentsMs": v[SUBS] / 1000,
+                            "missingMs": v[MISS] / 1000, "recordReadMs": v[READ] / 1000,
+                            "cacheHits": v[HITS], "parsed": v[PARSED], "fullReads": v[FULL] })
+    }
+}
+
 /// Milliseconds per step of a long call, in order.
 struct Laps { at: std::time::Instant, all: serde_json::Map<String, Value> }
 impl Laps {
@@ -3377,7 +3475,7 @@ impl Laps {
         self.all.insert(step.into(), json!((now - self.at).as_millis() as u64));
         self.at = now;
     }
-    fn done(self) -> Value { Value::Object(self.all) }
+    fn done(mut self) -> Value { self.all.insert("perChat".into(), prof::take()); Value::Object(self.all) }
 }
 
 /// Walk every transcript that belongs to one chat, oldest session first.
