@@ -700,6 +700,64 @@ fn archived_title(id: &str) -> Option<String> {
 fn read_json(p: &str) -> Option<Value> {
     fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok())
 }
+
+/// The fields of a chat record the list and the move bookkeeping read. A record
+/// also carries every connector's tool list (remoteMcpServersConfig, often a
+/// megabyte a chat), and building all of that into a Value for every chat made
+/// a scan take seconds; serde skips what a struct does not name without
+/// building it. Anything that does not fit falls back to the full read.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SlimRecord {
+    session_id: Option<Value>, title: Option<Value>, cwd: Option<Value>, model: Option<Value>,
+    created_at: Option<Value>, last_activity_at: Option<Value>, completed_turns: Option<Value>,
+    is_archived: Option<Value>, forked_from_session_id: Option<Value>, cli_session_id: Option<Value>,
+    prior_cli_session_ids: Option<Value>, bridge_session_ids: Option<Value>,
+    spawned_from: Option<SlimParent>, dispatch_parent_id: Option<Value>,
+    remote_mcp_servers_config: Option<Vec<SlimNamed>>,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SlimParent { session_id: Option<Value> }
+#[derive(serde::Deserialize)]
+struct SlimNamed { name: Option<Value> }
+
+fn slim_value(s: SlimRecord) -> Value {
+    let o = |v: Option<Value>| v.unwrap_or(Value::Null);
+    json!({
+        "sessionId": o(s.session_id), "title": o(s.title), "cwd": o(s.cwd), "model": o(s.model),
+        "createdAt": o(s.created_at), "lastActivityAt": o(s.last_activity_at),
+        "completedTurns": o(s.completed_turns), "isArchived": o(s.is_archived),
+        "forkedFromSessionId": o(s.forked_from_session_id), "cliSessionId": o(s.cli_session_id),
+        "priorCliSessionIds": o(s.prior_cli_session_ids), "bridgeSessionIds": o(s.bridge_session_ids),
+        "spawnedFrom": s.spawned_from.map(|p| json!({ "sessionId": o(p.session_id) })).unwrap_or(Value::Null),
+        "dispatchParentId": o(s.dispatch_parent_id),
+        "remoteMcpServersConfig": s.remote_mcp_servers_config.map(|v| Value::Array(
+            v.into_iter().map(|n| json!({ "name": o(n.name) })).collect())).unwrap_or(Value::Null),
+    })
+}
+
+/// A chat record for reading, slim (see SlimRecord), and kept between scans
+/// while the file's time and size are unchanged, so a refresh reads only the
+/// records that changed. Never used for a record that is written back.
+fn read_record(p: &str) -> Option<Value> {
+    use std::sync::{Mutex, OnceLock};
+    type Seen = std::collections::HashMap<String, (std::time::SystemTime, u64, Value)>;
+    static CACHE: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let meta = fs::metadata(p).ok()?;
+    let (when, len) = (meta.modified().ok()?, meta.len());
+    let cache = CACHE.get_or_init(|| Mutex::new(Default::default()));
+    if let Ok(c) = cache.lock() {
+        if let Some((w, l, v)) = c.get(p) {
+            if *w == when && *l == len { return Some(v.clone()); }
+        }
+    }
+    let text = fs::read_to_string(p).ok()?;
+    let v = serde_json::from_str::<SlimRecord>(&text).map(slim_value)
+        .or_else(|_| serde_json::from_str::<Value>(&text)).ok()?;
+    if let Ok(mut c) = cache.lock() { c.insert(p.to_string(), (when, len, v.clone())); }
+    Some(v)
+}
 #[cfg(target_os = "macos")]
 fn app_running() -> bool {
     // -a is not optional. pgrep hides itself and every one of its ancestors
@@ -1010,6 +1068,31 @@ mod lineage_tests {
 #[cfg(test)]
 mod moved_tests {
     use serde_json::json;
+
+    #[test]
+    fn a_slim_read_keeps_what_the_list_needs_and_drops_the_connector_tools() {
+        let d = std::env::temp_dir().join(format!("ferry-slim-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("local_s.json");
+        let tools: Vec<serde_json::Value> = (0..50).map(|i| json!({"name": format!("t{i}"), "schema": {"x": [1, 2, 3]}})).collect();
+        std::fs::write(&p, json!({"sessionId": "local_s", "cliSessionId": "c", "title": "T", "cwd": "C:\\w",
+            "isArchived": true, "completedTurns": 3, "createdAt": 1, "lastActivityAt": 2,
+            "spawnedFrom": {"sessionId": "local_p", "taskId": "x"}, "bridgeSessionIds": ["b1"],
+            "remoteMcpServersConfig": [{"name": "gmail", "tools": tools}], "somethingNew": {"big": [1, 2]}}).to_string()).unwrap();
+        let r = super::read_record(&p.to_string_lossy()).unwrap();
+        assert_eq!(r["sessionId"], "local_s");
+        assert_eq!(r["isArchived"], true);
+        assert_eq!(r["spawnedFrom"]["sessionId"], "local_p");
+        assert_eq!(super::parent_of(&r).as_deref(), Some("local_p"));
+        assert_eq!(r["bridgeSessionIds"][0], "b1");
+        assert_eq!(r["remoteMcpServersConfig"][0], json!({"name": "gmail"}), "only the name is kept");
+        // a record of a shape the slim read does not expect still reads, in full
+        std::fs::write(&p, json!({"sessionId": "local_s", "title": "T2", "remoteMcpServersConfig": {"odd": 1}}).to_string()).unwrap();
+        let r = super::read_record(&p.to_string_lossy()).unwrap();
+        assert_eq!(r["title"], "T2", "a changed file is read again");
+        assert_eq!(r["remoteMcpServersConfig"]["odd"], 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn scopes(v: serde_json::Value) -> std::collections::BTreeMap<String, serde_json::Value> {
         v.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -3106,7 +3189,7 @@ fn scan() -> Value {
             let name = e.file_name().to_string_lossy().to_string();
             if !(name.starts_with("local_") && name.ends_with(".json")) { continue; }
             let (acct, org) = (acct.clone(), org.clone());
-            let Some(rec) = read_json(&p.to_string_lossy()) else { continue };
+            let Some(rec) = read_record(&p.to_string_lossy()) else { continue };
             touch(&mut scopes, &root, &acct, &org);
             let key = format!("{}|{}|{}", root.id, acct, org);
             let tr = transcripts_for(&rec);
