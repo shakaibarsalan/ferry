@@ -1476,6 +1476,21 @@ fn remove_record(path: &str) -> std::io::Result<()> {
 }
 #[cfg(not(target_os = "windows"))]
 fn remove_record(path: &str) -> std::io::Result<()> { fs::remove_file(path) }
+/// The newest snapshot Ferry kept of each record, by session id. Snapshot
+/// names are `<stamp>-<tag>-local_<id>.json`.
+fn snapshot_index() -> std::collections::HashMap<String, String> {
+    let mut m: std::collections::HashMap<String, String> = Default::default();
+    let Ok(rd) = fs::read_dir(format!("{}/snapshots", vault())) else { return m };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        let Some(id) = n.rfind("local_").filter(|_| n.ends_with(".json"))
+            .and_then(|i| n.get(i..n.len() - 5)) else { continue };
+        let p = e.path().to_string_lossy().to_string();
+        if m.get(id).map(|old| *old < p).unwrap_or(true) { m.insert(id.to_string(), p); }
+    }
+    m
+}
+
 fn snapshot(p: &str, tag: &str) {
     if !Path::new(p).exists() { return; }
     let name = Path::new(p).file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -3063,6 +3078,9 @@ fn scan() -> Value {
     }).collect();
     let labs = labels();
     let profs = profiles();
+    // whether each profile's Claude is open: what the cards say depends on it
+    let open: std::collections::HashMap<String, bool> =
+        roots().iter().map(|r| (r.id.clone(), app_running_in(&r.path))).collect();
     let mut scopes: std::collections::BTreeMap<String, Value> = Default::default();
     // every transcript some account already answers for; the rest are sources
     let mut claimed: std::collections::HashSet<String> = Default::default();
@@ -3073,6 +3091,7 @@ fn scan() -> Value {
             "acct": acct, "org": org, "chats": [], "deleted": [],
             "root": root.id, "rootPath": root.path, "rootLabel": root.label,
             "rootBuiltin": root.builtin,
+            "running": open.get(&root.id).copied().unwrap_or(false),
             "connectors": {},
             "isCurrent": cur_in.get(&root.id).map(String::as_str) == Some(acct),
             "label": labs[acct].as_str().unwrap_or(""),
@@ -3147,10 +3166,15 @@ fn scan() -> Value {
         .flat_map(|s| s["chats"].as_array().cloned().unwrap_or_default())
         .filter_map(|c| Some((c["id"].as_str()?.to_string(), c["title"].as_str()?.to_string())))
         .collect();
+    // a chat that left under one id and lives on under another is still named,
+    // from the snapshot Ferry took as it went
+    let snaps = snapshot_index();
+    let snap_title = |id: &str| snaps.get(id).and_then(|p| read_json(p))
+        .and_then(|v| v["title"].as_str().map(String::from));
     for s in scopes.values_mut() {
         for d in s["deleted"].as_array_mut().unwrap() {
             let id = d["id"].as_str().unwrap_or("").to_string();
-            if let Some(t) = titles.get(&id).cloned().or_else(|| archived_title(&id)) {
+            if let Some(t) = titles.get(&id).cloned().or_else(|| archived_title(&id)).or_else(|| snap_title(&id)) {
                 d["title"] = json!(t);
             }
         }
@@ -3748,6 +3772,13 @@ fn finish_moves() -> usize {
 fn finish_moves_in(dirs: &[(String, String)], running: impl Fn(&str) -> bool) -> usize {
     let tombed = |dir: &str, id: &str|
         Path::new(&format!("{}/deleted_{}", dir, id.trim_start_matches("local_"))).exists();
+    // Mostly there is nothing to finish: look for a record beside its own
+    // tombstone in a closed profile by name before reading any record.
+    let pending = dirs.iter().any(|(r, d)| !running(r.as_str()) && fs::read_dir(d).map(|rd| rd.flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        n.starts_with("local_") && n.ends_with(".json") && tombed(d.as_str(), &n[..n.len() - 5])
+    })).unwrap_or(false));
+    if !pending { return 0; }
     let all: Vec<(&str, &str, Vec<(String, Value)>)> =
         dirs.iter().map(|(r, d)| (r.as_str(), d.as_str(), records_in(d))).collect();
     // where each conversation keeps a record that is not on a deleted list

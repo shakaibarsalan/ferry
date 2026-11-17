@@ -384,7 +384,21 @@ const LIVE=WIN||MAC;
 // A short line on a card, the rest on hover or keyboard focus: an i in a circle
 // carrying the whole explanation as its title (and for screen readers).
 const info=t=>' <span class=info tabindex=0 title="'+esc(t)+'" aria-label="'+esc(t)+'">ⓘ</span>';
-const reloadHint=on=>(LIVE&&on&&S&&S.appRunning)?" · Claude shows it the next time it opens that account":"";
+// said only when the destination's own Claude window is open and could not take
+// the chat now (another account is signed in there)
+const reloadHint=(on,t)=>(LIVE&&on&&t&&t.running)?" · Claude shows it the next time it opens that account":"";
+// What an open Claude window means for this transfer, said only when one of the
+// two accounts involved is open
+function cardNote(s,t,mv,imp){
+  const from=esc(short(s)),to=esc(short(t)),out=[];
+  if(mv!==false&&!imp&&s.running)out.push((mv===null?'If you move it, ':'')+from+
+    ' keeps showing it until that Claude window closes, and Ferry clears it then'+
+    info('An open Claude window keeps its chats in memory and saves them back, so Ferry finishes the move once '+
+      'that window is closed. Nothing is lost. Don’t delete it in Claude: that can remove the conversation the moved chat uses.'));
+  if(t.running)out.push(t.isCurrent?'It opens in '+to+'’s Claude window now'
+    :to+'’s Claude window lists it the next time it starts');
+  return out.length?'<p class=nbnote>'+out.join('. ')+'.</p>':'';
+}
 const MARK=`<svg class=mk viewBox="0 0 100 100" aria-hidden=true>\n <defs><mask id="gap">\n <rect width="100" height="100" fill="#fff"/>\n <rect x="57.4" y="38.9" width="18.6" height="11.8" fill="#000"/>\n </mask></defs>\n <path mask="url(#gap)" fill="currentColor" fill-rule="evenodd"\n d="M33 26.9h24.6a11.2 11.2 0 0 1 11.2 11.2v14.8a11.2 11.2 0 0 1-11.2 11.2H33\n A11.2 11.2 0 0 1 21.8 52.9V38.1A11.2 11.2 0 0 1 33 26.9Z\n M33.9 32.9h22.8a6 6 0 0 1 6 6v13.2a6 6 0 0 1-6 6H33.9a6 6 0 0 1-6-6V38.9a6 6 0 0 1 6-6Z"/>\n <path mask="url(#gap)" fill="currentColor" d="M31.2 63.4h14.1l-15 13.4Z"/>\n <rect x="42.5" y="42" width="33.5" height="5.6" rx="2.8" fill="#d97757"/>\n <path fill="#d97757" d="M81.2 44.8 70.8 37.9v13.8Z"/>\n </svg>`;
 let S=null,scopeKey=null,chatPath=null,q="",dragged=null,bodyRun=0,showArch=false,showMoved=false;
 
@@ -520,7 +534,7 @@ async function transfer(path,t,mv){
       : ok+(res&&res.newId?" as a new chat":"")+                       // see transfer_id
         (res&&res.forks?" with its "+res.forks+" fork"+(res.forks>1?"s":""):"")+   // see forks_of
         (res&&res.already?" · it was already there, so no second copy"   // see home_in
-         :res&&res.live?" · open in Claude now":reloadHint(!toCur)));   // see hand_to_open_claude
+         :res&&res.live?" · open in Claude now":reloadHint(!toCur,t)));   // see hand_to_open_claude
   }finally{closeAsk();busyOn=false;}
 }
 // The loading states, confirm card and mascot run on every platform (RICH).
@@ -778,13 +792,8 @@ function ask(p,t,mv){
      :mv?'<p>It moves to '+to+' and leaves '+from+', where you can restore it from the deleted list.</p>'
      :'<p>It is added to '+to+' and stays in '+from+'.</p>')+
     (toCur&&S.cursorRunning?'<p class=warn>Cursor is open, so Ferry can\'t write yet. Quit Cursor, then confirm.</p>':'')+
-    (!toCur&&S.appRunning?(LIVE
-      ?'<p class=nbnote>Claude is open, that’s fine'+(mv===false||imp?'':'. Leave the old copy in '+from+' alone')+
-        info('If '+short(t)+' is signed in to an open Claude window, the chat opens there now; if not, Claude shows it '+
-          'the next time it opens '+short(t)+'.'+(mv===false||imp?'':' A window that has '+short(s)+' open keeps '+
-          'listing it until that window restarts. Opening it there makes Claude keep a copy; deleting it there can '+
-          'delete the conversation the moved chat uses.'))+'</p>'
-      :'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>'):'')+
+    (toCur?'':LIVE?cardNote(s,t,mv,imp)
+      :S.appRunning?'<p class=warn>Claude is open, so Ferry can\'t write yet. Quit Claude, then confirm.</p>':'')+
     '<div class=askb>'+btn("an","Cancel")+
       (toCur?btn("ago","Convert",1)
        :imp?btn("ago","Add to "+to,1)
@@ -1217,7 +1226,7 @@ function askDelete(){
     '<div class=ct>'+esc(c.title)+'</div>'+
     '<p>It is removed from '+esc(short(s))+'. The conversation itself stays on disk and in your archive, '+
       'so you can restore it from the deleted list.</p>'+
-    (S.appRunning?'<p class=nbnote>Claude is open: quit it in this account first'+
+    (s.running?'<p class=nbnote>'+esc(short(s))+' is open in Claude: quit that window first'+
       info('An open Claude keeps this chat in memory and would put it back after Ferry removes it.')+'</p>':'')+
     '<div class=askb><button class=btn id=an>Cancel</button><button class="btn p" id=ago>Delete</button></div></div>';
   a.className="on";
@@ -1233,7 +1242,7 @@ function btnSend(mv){const t=S.scopes.find(x=>key(x)===(RICH?tgtKey:$("#tgt").va
 function send(path,t,mv){if(RICH)return transfer(path,t,mv);
   if(mv==="toCursor")return op("export_to_cursor",{path:path},"Converted into Cursor");
   op("copy_chat",{path:path,acct:t.acct,org:t.org,mv:mv,root:t.root},
-  (mv?"Moved to ":"Copied to ")+label(t)+reloadHint(true));}
+  (mv?"Moved to ":"Copied to ")+label(t)+reloadHint(true,t));}
 const undel=id=>{const s=scope();op("undelete_chat",{acct:s.acct,org:s.org,id:id,root:s.root},"Restored","Restoring…");};
 const setLabel=(a,v)=>op("set_label",{acct:a,name:v},"Saved");
 async function backup(){
