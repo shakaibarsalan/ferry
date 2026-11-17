@@ -3151,7 +3151,10 @@ fn diagnostics() -> Value {
 #[cfg_attr(target_os = "windows", tauri::command(async))]
 #[cfg_attr(not(target_os = "windows"), tauri::command)]
 fn scan() -> Value {
+    // how long each step took, returned with the scan for whoever needs to know
+    let mut laps = Laps::new();
     let finished = finish_moves();
+    laps.lap("finishMoves");
     let cur =read_json(&cfg()).and_then(|c| c["lastKnownAccountUuid"].as_str().map(String::from));
     // Each profile is signed into its own account, so "the one you are signed
     // into" is a question per root, not per machine.
@@ -3160,10 +3163,13 @@ fn scan() -> Value {
         Some((r.id.clone(), who))
     }).collect();
     let labs = labels();
+    laps.lap("configs");
     let profs = profiles();
+    laps.lap("profiles");
     // whether each profile's Claude is open: what the cards say depends on it
     let open: std::collections::HashMap<String, bool> =
         roots().iter().map(|r| (r.id.clone(), app_running_in(&r.path))).collect();
+    laps.lap("openWindows");
     let mut scopes: std::collections::BTreeMap<String, Value> = Default::default();
     // every transcript some account already answers for; the rest are sources
     let mut claimed: std::collections::HashSet<String> = Default::default();
@@ -3242,6 +3248,7 @@ fn scan() -> Value {
                               "path": p.to_string_lossy() }));
         }
     }
+    laps.lap("records");
     mark_moved(&mut scopes);
     let snaps = snapshot_index();
     // A deleted entry for a chat the account has under another id - it came
@@ -3290,6 +3297,7 @@ fn scan() -> Value {
         if scopes.keys().any(|k| k.starts_with(&mine)) { continue; }
         touch(&mut scopes, &root, &acct, &org);
     }
+    laps.lap("deletedAndMoved");
     let mut list: Vec<Value> = scopes.into_values().collect();
     for s in list.iter_mut() {
         let c = s["chats"].as_array_mut().unwrap();
@@ -3301,15 +3309,22 @@ fn scan() -> Value {
         s["chats"].as_array().unwrap().iter().map(|c| c["last"].as_u64().unwrap_or(0)).max().unwrap_or(0)));
     // CLI and VS Code sessions come after the accounts: they are where chats are
     // imported from, not an account you can send one to.
+    laps.lap("sort");
     list.extend(source_scopes(&claimed));
+    laps.lap("sources");
     if let Some(c) = cursor_scope() { list.push(c); }
-    json!({ "scopes": list, "current": cur, "appRunning": app_running(), "finished": finished,
-            "cursorRunning": cursor_running(),
-            "locations": location_list(),
+    laps.lap("cursor");
+    let (app, cur_run, locs) = (app_running(), cursor_running(), location_list());
+    laps.lap("running");
+    let diag = diagnostics();
+    laps.lap("diagnostics");
+    json!({ "scopes": list, "current": cur, "appRunning": app, "finished": finished,
+            "cursorRunning": cur_run,
+            "locations": locs, "timing": laps.done(),
             "vault": vault(), "exportDir": last_export_dir(),
             "version": env!("CARGO_PKG_VERSION"),
             "paths": { "sessions": sess(), "projects": proj(), "home": home() },
-            "diag": diagnostics() })
+            "diag": diag })
 }
 
 /// Find the chats a running Claude wrote back after Ferry moved them out. A
@@ -3351,6 +3366,18 @@ fn mark_moved(scopes: &mut std::collections::BTreeMap<String, Value>) {
         }
         s["deleted"].as_array_mut().unwrap().retain(|d| d["id"].as_str() != Some(id.as_str()));
     }
+}
+
+/// Milliseconds per step of a long call, in order.
+struct Laps { at: std::time::Instant, all: serde_json::Map<String, Value> }
+impl Laps {
+    fn new() -> Self { Laps { at: std::time::Instant::now(), all: Default::default() } }
+    fn lap(&mut self, step: &str) {
+        let now = std::time::Instant::now();
+        self.all.insert(step.into(), json!((now - self.at).as_millis() as u64));
+        self.at = now;
+    }
+    fn done(self) -> Value { Value::Object(self.all) }
 }
 
 /// Walk every transcript that belongs to one chat, oldest session first.
