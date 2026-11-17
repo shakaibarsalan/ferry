@@ -3160,6 +3160,25 @@ fn scan() -> Value {
         }
     }
     mark_moved(&mut scopes);
+    let snaps = snapshot_index();
+    // A deleted entry for a chat the account has under another id - it came
+    // back as a new chat, or a move back reused the record there - would restore
+    // only a second copy of it, so it is not listed.
+    let conv_of: std::collections::HashMap<String, String> = scopes.values()
+        .flat_map(|s| s["chats"].as_array().cloned().unwrap_or_default())
+        .filter_map(|c| Some((c["id"].as_str()?.to_string(), c["conv"].as_str()?.to_string())))
+        .collect();
+    for s in scopes.values_mut() {
+        let here: std::collections::HashSet<String> = s["chats"].as_array().map(|a| a.iter()
+            .filter_map(|c| c["conv"].as_str().map(String::from)).collect()).unwrap_or_default();
+        if here.is_empty() { continue; }
+        s["deleted"].as_array_mut().unwrap().retain(|d| {
+            let id = d["id"].as_str().unwrap_or("");
+            let conv = conv_of.get(id).cloned().or_else(|| snaps.get(id).and_then(|p| read_json(p))
+                .and_then(|v| v["cliSessionId"].as_str().map(String::from)));
+            !conv.map(|c| here.contains(&c)).unwrap_or(false)
+        });
+    }
     // A deleted chat is named by its title where one survives: in the account a
     // move took it to, else in the newest archived copy, which Restore would use.
     let titles: std::collections::HashMap<String, String> = scopes.values()
@@ -3168,7 +3187,6 @@ fn scan() -> Value {
         .collect();
     // a chat that left under one id and lives on under another is still named,
     // from the snapshot Ferry took as it went
-    let snaps = snapshot_index();
     let snap_title = |id: &str| snaps.get(id).and_then(|p| read_json(p))
         .and_then(|v| v["title"].as_str().map(String::from));
     for s in scopes.values_mut() {
@@ -4102,6 +4120,14 @@ fn undelete_chat(acct: String, org: String, id: String, root: Option<String>)
     let mut rec = read_json(&src.to_string_lossy()).ok_or("copy unreadable")?;
     if let Some(o) = rec.as_object_mut() { for k in ACCOUNT_SCOPED { o.remove(k); } }
     let dir = format!("{}/{}/{}", sess_in(&dst.path), acct, org);
+    // the account has this conversation under another id: restoring would only
+    // list it twice
+    if let Some((_, have)) = rec["cliSessionId"].as_str().and_then(|cli| home_in(&dir, cli)) {
+        if have["sessionId"].as_str() != Some(id.as_str()) {
+            return Err(format!("\u{201c}{}\u{201d} is already in this account, so there is nothing to restore.",
+                               have["title"].as_str().unwrap_or("This chat")));
+        }
+    }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::write(format!("{}/{}.json", dir, id), serde_json::to_string_pretty(&rec).unwrap())
         .map_err(|e| e.to_string())?;
