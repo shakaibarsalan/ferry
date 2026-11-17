@@ -735,7 +735,7 @@ struct SlimRecord {
     created_at: Option<Value>, last_activity_at: Option<Value>, completed_turns: Option<Value>,
     is_archived: Option<Value>, forked_from_session_id: Option<Value>, cli_session_id: Option<Value>,
     prior_cli_session_ids: Option<Value>, bridge_session_ids: Option<Value>,
-    spawned_from: Option<SlimParent>, dispatch_parent_id: Option<Value>,
+    spawned_from: Option<SlimParent>, dispatch_parent_id: Option<Value>, lineage_detached: Option<Value>,
     remote_mcp_servers_config: Option<Vec<SlimNamed>>,
 }
 #[derive(serde::Deserialize)]
@@ -753,7 +753,7 @@ fn slim_value(s: SlimRecord) -> Value {
         "forkedFromSessionId": o(s.forked_from_session_id), "cliSessionId": o(s.cli_session_id),
         "priorCliSessionIds": o(s.prior_cli_session_ids), "bridgeSessionIds": o(s.bridge_session_ids),
         "spawnedFrom": s.spawned_from.map(|p| json!({ "sessionId": o(p.session_id) })).unwrap_or(Value::Null),
-        "dispatchParentId": o(s.dispatch_parent_id),
+        "dispatchParentId": o(s.dispatch_parent_id), "lineageDetached": o(s.lineage_detached),
         "remoteMcpServersConfig": s.remote_mcp_servers_config.map(|v| Value::Array(
             v.into_iter().map(|n| json!({ "name": o(n.name) })).collect())).unwrap_or(Value::Null),
     })
@@ -1057,7 +1057,7 @@ mod lineage_tests {
         put(&d, json!({"sessionId": "local_c", "cliSessionId": "conv-c",
                        "forkedFromSessionId": "local_old-p",
                        "spawnedFrom": {"sessionId": "local_old-p", "sideSession": true}}));
-        let n = super::mend_lineage_with(&d.to_string_lossy(),
+        let n = super::mend_lineage_with_all(&d.to_string_lossy(),
             |id| (id == "local_old-p").then(|| "conv-p".to_string()));
         assert_eq!(n, 1);
         let c: serde_json::Value = serde_json::from_str(&fs::read_to_string(d.join("local_c.json")).unwrap()).unwrap();
@@ -1065,7 +1065,7 @@ mod lineage_tests {
         assert_eq!(c["spawnedFrom"]["sessionId"], "local_conv-p");
         assert_eq!(c["spawnedFrom"]["sideSession"], true);
         assert!(!d.join("local_c.json.ferrytmp").exists());
-        assert_eq!(super::mend_lineage_with(&d.to_string_lossy(), |_| None), 0, "nothing left to mend");
+        assert_eq!(super::mend_lineage_with_all(&d.to_string_lossy(), |_| None), 0, "nothing left to mend");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1085,6 +1085,50 @@ mod lineage_tests {
         assert_eq!(r["spawnedFrom"]["userFork"], true);
         assert_eq!(r["sessionId"], "local_conv-c", "Claude's id stays");
         assert_eq!(r["title"], "Claude's title", "only the link is copied");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_chat_detached_to_top_level_has_no_parent_and_is_not_carried() {
+        let detached = json!({"sessionId": "local_c", "forkedFromSessionId": "local_p",
+                              "spawnedFrom": {"sessionId": "local_p", "sideSession": true},
+                              "lineageDetached": true, "lineageDetachedBy": "user"});
+        assert_eq!(super::parent_of(&detached), None);
+        let d = std::env::temp_dir().join(format!("ferry-detached-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        put(&d, json!({"sessionId": "local_p", "cliSessionId": "p"}));
+        put(&d, detached.clone());
+        put(&d, json!({"sessionId": "local_k", "cliSessionId": "k", "spawnedFrom": {"sessionId": "local_c"}}));
+        let carried: Vec<String> = super::forks_of(&d.to_string_lossy(), "local_p").into_iter()
+            .map(|(_, r)| r["sessionId"].as_str().unwrap().to_string()).collect();
+        assert!(carried.is_empty(), "moving the old parent leaves the detached chat and its forks: {carried:?}");
+        let mine: Vec<String> = super::forks_of(&d.to_string_lossy(), "local_c").into_iter()
+            .map(|(_, r)| r["sessionId"].as_str().unwrap().to_string()).collect();
+        assert_eq!(mine, ["local_k"], "its own forks still go with it");
+        // a hand-off keeps it detached
+        let adopted = d.join("local_adopted.json");
+        fs::write(&adopted, json!({"sessionId": "local_adopted"}).to_string()).unwrap();
+        super::restore_lineage(&adopted.to_string_lossy(), &detached);
+        let r: serde_json::Value = serde_json::from_str(&fs::read_to_string(&adopted).unwrap()).unwrap();
+        assert_eq!(r["lineageDetached"], true);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_transfer_mends_only_the_chats_it_brought_in() {
+        let d = std::env::temp_dir().join(format!("ferry-mendonly-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        // the parent came in under a new id; two chats name its old id
+        put(&d, json!({"sessionId": "local_new-p", "cliSessionId": "conv-p"}));
+        put(&d, json!({"sessionId": "local_moved", "cliSessionId": "m", "forkedFromSessionId": "local_old-p"}));
+        put(&d, json!({"sessionId": "local_stays", "cliSessionId": "s", "forkedFromSessionId": "local_old-p"}));
+        let only: std::collections::HashSet<String> = ["local_moved".to_string()].into_iter().collect();
+        let n = super::mend_lineage_with(&d.to_string_lossy(), |_| Some("conv-p".into()),
+            |r| r["sessionId"].as_str().map(|s| only.contains(s)).unwrap_or(false));
+        assert_eq!(n, 1);
+        let read = |id: &str| -> serde_json::Value { serde_json::from_str(&fs::read_to_string(d.join(format!("{id}.json"))).unwrap()).unwrap() };
+        assert_eq!(read("local_moved")["forkedFromSessionId"], "local_new-p", "the chat it moved finds its parent");
+        assert_eq!(read("local_stays")["forkedFromSessionId"], "local_old-p", "a chat it did not move is left as it was");
         let _ = fs::remove_dir_all(&d);
     }
 }
@@ -3720,12 +3764,16 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
         }
     }
     let first = transfer_one(&path, &rec, &dst, &acct, &dst_dir, mv)?;
+    // the ids this transfer brought in: the only records its mend may touch
+    let id_of = |w: &str| Path::new(w).file_stem().map(|s| s.to_string_lossy().to_string());
+    let mut landed_ids: std::collections::HashSet<String> = id_of(&first.wrote).into_iter().collect();
     let mut live_forks: Vec<(String, Value)> = vec![];
     if first.live && parent_of(&rec).is_some() { live_forks.push((first.wrote.clone(), rec.clone())); }
     let mut carried = 0;
     for (p, r) in &forks {
         if let Ok(landed) = transfer_one(p, r, &dst, &acct, &dst_dir, mv) {
             carried += 1;
+            landed_ids.extend(id_of(&landed.wrote));
             if landed.live { live_forks.push((landed.wrote, r.clone())); }
         }
     }
@@ -3734,8 +3782,8 @@ fn copy_chat(path: String, acct: String, org: String, mv: bool, root: Option<Str
         std::thread::sleep(std::time::Duration::from_millis(1200));
         for (wrote, src) in &live_forks { restore_lineage(wrote, src); }
     }
-    // every fork in that account now finds its parent by its id there
-    let relinked = mend_lineage(&dst_dir);
+    // every chat this transfer brought in now finds its parent by its id there
+    let relinked = mend_lineage(&dst_dir, &landed_ids);
     Ok(json!({ "ok": true, "wrote": first.wrote, "moved": mv, "live": first.live, "newId": first.new_id,
                "already": first.already, "forks": carried, "relinked": relinked }))
 }
@@ -3818,6 +3866,10 @@ fn home_in(dir: &str, cli: &str) -> Option<(String, Value)> {
 /// when a parent lands somewhere under another id - Claude's own adopt always
 /// names it local_<conversation id> - its forks lose it unless they are told.
 fn parent_of(rec: &Value) -> Option<String> {
+    // A chat detached to top level (Claude's "Detach to top level" sets
+    // lineageDetached) has no parent, whatever it was forked from: Claude lists
+    // it on its own, so Ferry neither carries it with that chat nor links it back.
+    if rec["lineageDetached"].as_bool().unwrap_or(false) { return None; }
     rec["forkedFromSessionId"].as_str()
         .or_else(|| rec["spawnedFrom"]["sessionId"].as_str())
         .or_else(|| rec["dispatchParentId"].as_str())
@@ -3838,8 +3890,10 @@ fn repoint_parent(rec: &mut Value, old: &str, new: &str) -> bool {
 }
 
 /// The fields a fork's link to its parent is made of.
-const LINEAGE: [&str; 5] = ["forkedFromSessionId", "forkedAtMessageUuid", "spawnedFrom",
-                            "dispatchParentId", "dispatchParentOrigin"];
+const LINEAGE: [&str; 7] = ["forkedFromSessionId", "forkedAtMessageUuid", "spawnedFrom",
+                            "dispatchParentId", "dispatchParentOrigin",
+                            // a detached chat stays detached through a hand-off
+                            "lineageDetached", "lineageDetachedBy"];
 
 /// Claude's adopt keeps no link to a parent, so a fork handed to an open
 /// Claude is listed there at once but on its own. Put the link back on the
@@ -3955,13 +4009,27 @@ fn conversation_of(id: &str) -> Option<String> {
 /// Mend the links in one account folder after chats have landed in it: a fork
 /// whose parent id is not there is pointed at the record of the same
 /// conversation that is, which is where its parent went. How many it mended.
-fn mend_lineage(dir: &str) -> usize { mend_lineage_with(dir, conversation_of) }
+/// Only the chats `only` names are mended - the ones a transfer just brought in.
+/// A chat already in the account whose parent is missing was left that way by
+/// Claude or by the user, and linking it to some record of the same conversation
+/// would nest a chat that was meant to stand on its own.
+fn mend_lineage(dir: &str, only: &std::collections::HashSet<String>) -> usize {
+    mend_lineage_with(dir, conversation_of,
+                      |r| r["sessionId"].as_str().map(|s| only.contains(s)).unwrap_or(false))
+}
 
-fn mend_lineage_with(dir: &str, conversation: impl Fn(&str) -> Option<String>) -> usize {
+#[cfg(test)]
+fn mend_lineage_with_all(dir: &str, conversation: impl Fn(&str) -> Option<String>) -> usize {
+    mend_lineage_with(dir, conversation, |_| true)
+}
+
+fn mend_lineage_with(dir: &str, conversation: impl Fn(&str) -> Option<String>,
+                     may: impl Fn(&Value) -> bool) -> usize {
     let recs = records_in(dir);
     let ids: Vec<&str> = recs.iter().filter_map(|(_, r)| r["sessionId"].as_str()).collect();
     let mut mended = 0;
     for (path, rec) in &recs {
+        if !may(rec) { continue; }
         let Some(old) = parent_of(rec) else { continue };
         if ids.contains(&old.as_str()) { continue; }
         let Some(conv) = conversation(&old) else { continue };
@@ -4033,7 +4101,9 @@ fn finish_moves_in(dirs: &[(String, String)], running: impl Fn(&str) -> bool) ->
             if remove_record(p).is_ok() { done += 1; gone.insert(id.to_string(), c.to_string()); }
         }
         if !gone.is_empty() {
-            mend_lineage_with(d, |id| gone.get(id).cloned().or_else(|| conversation_of(id)));
+            // only the forks of the copies just taken out follow the record that stays
+            mend_lineage_with(d, |id| gone.get(id).cloned().or_else(|| conversation_of(id)),
+                              |r| parent_of(r).map(|p| gone.contains_key(&p)).unwrap_or(false));
         }
     }
     done
