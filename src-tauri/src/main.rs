@@ -693,7 +693,7 @@ fn archived_copy_in(vault: &str, id: &str) -> Option<PathBuf> {
 
 /// The title of a chat's newest kept copy.
 fn archived_title(id: &str) -> Option<String> {
-    read_json(&archived_copy(id)?.to_string_lossy())?["title"].as_str()
+    read_record(&archived_copy(id)?.to_string_lossy())?["title"].as_str()
         .filter(|t| !t.is_empty()).map(str::to_string)
 }
 
@@ -3257,7 +3257,7 @@ fn scan() -> Value {
         if here.is_empty() { continue; }
         s["deleted"].as_array_mut().unwrap().retain(|d| {
             let id = d["id"].as_str().unwrap_or("");
-            let conv = conv_of.get(id).cloned().or_else(|| snaps.get(id).and_then(|p| read_json(p))
+            let conv = conv_of.get(id).cloned().or_else(|| snaps.get(id).and_then(|p| read_record(p))
                 .and_then(|v| v["cliSessionId"].as_str().map(String::from)));
             !conv.map(|c| here.contains(&c)).unwrap_or(false)
         });
@@ -3270,7 +3270,7 @@ fn scan() -> Value {
         .collect();
     // a chat that left under one id and lives on under another is still named,
     // from the snapshot Ferry took as it went
-    let snap_title = |id: &str| snaps.get(id).and_then(|p| read_json(p))
+    let snap_title = |id: &str| snaps.get(id).and_then(|p| read_record(p))
         .and_then(|v| v["title"].as_str().map(String::from));
     for s in scopes.values_mut() {
         for d in s["deleted"].as_array_mut().unwrap() {
