@@ -801,7 +801,11 @@ fn claude_instances() -> Vec<(String, Option<String>)> {
 
 /// (app bundle, profile folder) for each line of `ps -o command=` that is a
 /// Claude app's own process: its executable is `<x>.app/Contents/MacOS/Claude`
-/// and nothing else, so the helper processes and the `claude` CLI are left out.
+/// and nothing else. A helper ("…/Contents/Frameworks/Claude Helper.app/
+/// Contents/MacOS/Claude Helper …") has that text in it too, followed by a
+/// space, so the executable has to end there and be followed by nothing or an
+/// option, and must not sit inside another app's Frameworks. The `claude` CLI
+/// never matches.
 #[cfg(any(target_os = "macos", test))]
 fn parse_instances(ps: &str) -> Vec<(String, Option<String>)> {
     const EXE: &str = ".app/Contents/MacOS/Claude";
@@ -809,7 +813,8 @@ fn parse_instances(ps: &str) -> Vec<(String, Option<String>)> {
         let l = l.trim_start();
         let i = l.find(EXE)?;
         let rest = &l[i + EXE.len()..];
-        if !(rest.is_empty() || rest.starts_with(' ')) { return None; }
+        if !(rest.is_empty() || rest.starts_with(" -")) { return None; }
+        if l[..i].contains("/Contents/Frameworks/") { return None; }
         let dir = rest.find("--user-data-dir=").map(|j| {
             let v = &rest[j + "--user-data-dir=".len()..];
             v.split(" --").next().unwrap_or(v).trim().trim_matches('"').to_string()
