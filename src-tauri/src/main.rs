@@ -785,12 +785,46 @@ fn read_record(p: &str) -> Option<Value> {
     Some(v)
 }
 #[cfg(target_os = "macos")]
-fn app_running() -> bool {
-    // -a is not optional. pgrep hides itself and every one of its ancestors
-    // unless it is passed, so a Ferry launched from the target app's own
-    // terminal would be told the app is not running.
-    Command::new("pgrep").args(["-a", "-f", "Claude.app/Contents/MacOS/Claude"])
-        .output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
+fn app_running() -> bool { !claude_instances().is_empty() }
+
+/// Every Claude desktop app running, with the profile folder it was started
+/// with: `--user-data-dir`, or None for Claude's own folder. Read from the
+/// whole process list, so a copy of Claude.app under another name ("Claude
+/// 2.app", which is how a second account runs beside the first) counts too;
+/// matching "Claude.app/..." missed those, and Ferry took a Claude that was
+/// open for closed.
+#[cfg(target_os = "macos")]
+fn claude_instances() -> Vec<(String, Option<String>)> {
+    let Ok(o) = Command::new("ps").args(["-axww", "-o", "command="]).output() else { return vec![] };
+    parse_instances(&String::from_utf8_lossy(&o.stdout))
+}
+
+/// (app bundle, profile folder) for each line of `ps -o command=` that is a
+/// Claude app's own process: its executable is `<x>.app/Contents/MacOS/Claude`
+/// and nothing else, so the helper processes and the `claude` CLI are left out.
+#[cfg(any(target_os = "macos", test))]
+fn parse_instances(ps: &str) -> Vec<(String, Option<String>)> {
+    const EXE: &str = ".app/Contents/MacOS/Claude";
+    ps.lines().filter_map(|l| {
+        let l = l.trim_start();
+        let i = l.find(EXE)?;
+        let rest = &l[i + EXE.len()..];
+        if !(rest.is_empty() || rest.starts_with(' ')) { return None; }
+        let dir = rest.find("--user-data-dir=").map(|j| {
+            let v = &rest[j + "--user-data-dir=".len()..];
+            v.split(" --").next().unwrap_or(v).trim().trim_matches('"').to_string()
+        });
+        Some((l[..i + 4].to_string(), dir))
+    }).collect()
+}
+
+/// The running Claude app that has `root` open, if one has.
+#[cfg(target_os = "macos")]
+fn instance_for(root: &str) -> Option<String> {
+    claude_instances().into_iter().find(|(_, d)| match d {
+        Some(d) => same_dir(d, root),
+        None => same_dir(root, &claude_dir()),
+    }).map(|(app, _)| app)
 }
 /// Every folder a Windows Claude can keep its state in: a direct install's
 /// %APPDATA%\Claude, the Microsoft Store build's
@@ -1133,6 +1167,31 @@ mod lineage_tests {
     }
 }
 
+/// Which Claude is open on a Mac, read from the process list.
+#[cfg(test)]
+mod mac_instance_tests {
+    #[test]
+    fn every_copy_of_claude_counts_with_its_folder_and_nothing_else_does() {
+        let ps = "\
+/Applications/Claude.app/Contents/MacOS/Claude
+/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process
+/Users/u/Applications/.claude-copies/Claude 2.app/Contents/MacOS/Claude --user-data-dir=/Users/u/ClaudeAccounts/Account2
+/Users/u/Applications/.claude-copies/Claude 2.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/u/ClaudeAccounts/Account2
+/Users/u/Applications/.claude-copies/Claude 3.app/Contents/MacOS/Claude --user-data-dir=\"/Users/u/Claude Accounts/Account 3\" --some-flag
+/Users/u/.local/bin/claude --resume abc
+  /Users/u/Applications/Claude 4.app/Contents/MacOS/Claude --user-data-dir=/Users/u/ClaudeAccounts/Account4/";
+        let got = super::parse_instances(ps);
+        assert_eq!(got, vec![
+            ("/Applications/Claude.app".to_string(), None),
+            ("/Users/u/Applications/.claude-copies/Claude 2.app".to_string(), Some("/Users/u/ClaudeAccounts/Account2".to_string())),
+            ("/Users/u/Applications/.claude-copies/Claude 3.app".to_string(), Some("/Users/u/Claude Accounts/Account 3".to_string())),
+            ("/Users/u/Applications/Claude 4.app".to_string(), Some("/Users/u/ClaudeAccounts/Account4/".to_string())),
+        ]);
+        assert!(super::same_dir(got[3].1.as_deref().unwrap(), "/Users/u/ClaudeAccounts/Account4"),
+                "a trailing slash names the same folder");
+    }
+}
+
 /// A chat a running Claude wrote back after a move is told apart from a copy.
 /// Platform-neutral, like the lineage tests.
 #[cfg(test)]
@@ -1386,12 +1445,14 @@ fn guard() -> Result<(), String> {
 
 /// A write into one profile only has to wait for the Claude that has *that*
 /// profile open. On Windows every profile holds its own lockfile, so the
-/// question can be asked per folder. Elsewhere there is one process list and
-/// nothing in it says which folder the app was started with, so the answer
-/// stays the cautious one: any Claude blocks every write, as it always did.
+/// question can be asked per folder. On a Mac the process list says which
+/// folder each Claude was started with (see claude_instances). Elsewhere the
+/// answer stays the cautious one: any Claude blocks every write.
 #[cfg(target_os = "windows")]
 fn app_running_in(root: &str) -> bool { lock_held(&format!("{}\\lockfile", root)) }
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn app_running_in(root: &str) -> bool { instance_for(root).is_some() }
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn app_running_in(_root: &str) -> bool { app_running() }
 
 fn guard_in(root: &Root) -> Result<(), String> {
@@ -1501,12 +1562,15 @@ fn send_resume(root: &Root, url: &str) -> bool {
             .arg(url).spawn().is_ok()).unwrap_or(false)
     }
 }
-/// On a Mac `open` hands the link to the running Claude.app, which takes it in
-/// the window for Claude's own folder. A copy started with --user-data-dir is
-/// not one a link can be aimed at there, so those keep the written record.
+/// On a Mac every copy of Claude.app shares one bundle id and the claude://
+/// scheme, so a bare `open <link>` lets macOS pick a copy - or start the main
+/// app. `open -a` names the copy that has this profile open (it is running, or
+/// hand_to_open_claude would not have got here), and -g leaves Ferry in front.
 #[cfg(target_os = "macos")]
 fn send_resume(root: &Root, url: &str) -> bool {
-    root.builtin && Command::new("open").arg(url).status().map(|s| s.success()).unwrap_or(false)
+    let Some(app) = instance_for(&root.path) else { return false };
+    Command::new("open").args(["-g", "-a", app.as_str(), url])
+        .status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// What `claude://resume` accepts: Claude checks for exactly this uuid shape.
